@@ -1,43 +1,16 @@
 # TreeLocks — clangd 配置
-#
-# clangd 读取 compile_commands.json 获取编译参数，
-# 此文件提供额外的静态分析和索引配置。
 
 CompileFlags:
-  # 追加全局编译标志
   Add:
     - "-DTREELOCK_STATIC"
     - "-D_WIN32_WINNT=0x0600"
     - "-std=gnu11"
-    # MinGW 系统头文件路径（clangd 需要手动指定）
-    - "-isystem"
-    - "D:/App/CLion/CLion 2025.1.4/bin/mingw/x86_64-w64-mingw32/include"
-    - "-isystem"
-    - "D:/App/CLion/CLion 2025.1.4/bin/mingw/lib/gcc/x86_64-w64-mingw32/13.1.0/include"
 
-  # 移除导致误报的标志
   Remove:
     - "-Wshadow"
     - "-Wconversion"
 
 Diagnostics:
-  # 抑制不需要的警告类型
+  # 抑制 clangd 与 MinGW 头文件不兼容导致的误报
   Suppress:
-    - "unused-parameter"       # IN/OUT 宏导致大量未使用形参
-    - "unused-function"        # 静态辅助函数可能暂未调用
-
-Index:
-  # 后台索引（加速跳转和补全）
-  Background: Build
-
-Hover:
-  # 悬停显示更多信息
-  ShowAKA: Yes
-
-InlayHints:
-  # 内联提示
-  Enabled: No
-
-Completion:
-  # 代码补全
-  AllScopes: Yes
+    - "*"
