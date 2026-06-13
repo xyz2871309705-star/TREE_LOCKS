@@ -307,33 +307,22 @@ treelock_log_set_level(TREELOCK_LOG_WARN);  // 运行期过滤
 
 ## 测试
 
-| 测试 | 用例数 | 命令 |
-|------|--------|------|
-| 协议正确性 | 12 | `./build/tests/test_protocol` |
-| 并发压力 | 3 | `./build/tests/test_concurrent` |
-| 树结构管理 | 51 | `./build/tests/test_tree` |
+| 测试 | 用例数 | 框架 | 命令 |
+|------|--------|------|------|
+| 协议正确性 | 12 | Google Test | `./build/tests/test_protocol` |
+| 日志模块 | 12 | Google Test | `./build/tests/test_log` |
+| 并发压力 | 3 | Google Test | `./build/tests/test_concurrent` |
+| 树结构管理 | 9 | Google Test | `./build/tests/test_tree` |
+
+> **测试框架**: Google Test v1.15.2 (C++)，通过 `_deps/googletest/` 本地副本提供，CMake `FetchContent` 集成。
 
 ```
+$ ctest --output-on-failure
+100% tests passed, 0 tests failed out of 4
+
 $ ./tests/test_protocol
-兼容矩阵测试:
-  TEST: NL compatible with all modes ... PASSED
-  TEST: X compatible only with NL ... PASSED
-  ...
-结果: 12/12 通过, 0 失败
-
-$ ./tests/test_concurrent
-  TEST: concurrent multi-client lock/unlock ... PASSED (8000 ops)
-  TEST: concurrent consistency (shared instance) ... PASSED
-  TEST: concurrent lock escalate ... PASSED
-结果: 3/3 通过, 0 失败
-
-$ ./tests/test_tree
---- Test 1: manual register_node ---
-  PASS: create client
-  ...
---- Test 9: backward compatibility (no tree) ---
-  PASS: lock without tree works (backward compat)
-结果: 51/51 通过, 0 失败
+[==========] 12 tests from 5 test suites ran. (0 ms total)
+[  PASSED  ] 12 tests.
 ```
 
 ---

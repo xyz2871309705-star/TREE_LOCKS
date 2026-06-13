@@ -46,6 +46,9 @@ _TEMP/
 # Claude Code local settings
 .claude/
 
+# Third-party dependencies (fetched locally)
+_deps/
+
 # OS files
 .DS_Store
 Thumbs.db

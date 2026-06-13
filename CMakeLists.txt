@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(TreeLocks VERSION 0.1.0 LANGUAGES C)
+project(TreeLocks VERSION 0.1.0 LANGUAGES C CXX)
 
 # ============================================================================
 # LSP 支持: 始终生成 compile_commands.json (clangd / ccls / IDE)
@@ -43,6 +43,10 @@ message(STATUS "C compiler:      ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSI
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)  # 需要 GNU 扩展 (##__VA_ARGS__, pthread)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 # ============================================================================
 # 构建类型
