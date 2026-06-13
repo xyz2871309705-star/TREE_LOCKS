@@ -4,24 +4,24 @@ project(TreeLocks VERSION 0.1.0 LANGUAGES C)
 # ============================================================================
 # LSP 支持: 始终生成 compile_commands.json (clangd / ccls / IDE)
 # 并展开 @rsp 响应文件（Windows 上 CMake 默认使用，clangd 无法解析）
+#
+# clangd 通过 --compile-commands-dir=build 读取，无需项目根副本。
 # ============================================================================
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# 配置完成后自动展开 @rsp → 项目根 compile_commands.json
+# 构建时自动展开 build/compile_commands.json 中的 @rsp 引用
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_FOUND)
     add_custom_target(expand_compile_commands ALL
         COMMAND ${Python3_EXECUTABLE}
             "${CMAKE_SOURCE_DIR}/cmake/expand_cc.py"
             "${CMAKE_BINARY_DIR}"
-            -o "${CMAKE_SOURCE_DIR}/compile_commands.json"
-        BYPRODUCTS "${CMAKE_SOURCE_DIR}/compile_commands.json"
-        COMMENT "展开 compile_commands.json 中的 @rsp (clangd)"
+            -o "${CMAKE_BINARY_DIR}/compile_commands.json"
+        COMMENT "展开 compile_commands.json 中的 @rsp (clangd ready)"
         VERBATIM
     )
-    message(STATUS "clangd: @rsp 将在构建时自动展开 (via Python)")
 else()
-    message(WARNING "Python3 not found — compile_commands.json 不会被展开，clangd 可能无法跳转")
+    message(WARNING "Python3 not found — compile_commands.json @rsp 不会展开，clangd 可能无法跳转")
 endif()
 
 # ============================================================================
