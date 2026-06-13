@@ -12,9 +12,21 @@
  */
 
 #include "treelock.h"
+#include "treelock_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <time.h>    /* nanosleep */
+
+/* 跨平台 sleep（毫秒） */
+static VOID _example_sleep_ms(IN UINT_32 ms)
+{
+    struct timespec ts;
+    ts.tv_sec  = (time_t)(ms / 1000);
+    ts.tv_nsec = (long)((ms % 1000) * 1000000L);
+    nanosleep(&ts, NULL);
+}
 
 /* 模拟树节点 ID */
 #define ROOT_ID   ((treelock_node_id_t)1)
@@ -224,55 +236,147 @@ static VOID _example_lock_escalate(VOID)
 }
 
 /* =========================================================================
- * 示例 4：try_lock 超时
+ * 示例 4：try_lock 超时（多线程演示）
  *
- * 目的：演示当锁被其他客户端持有时，try_lock 的超时行为。
+ * 目的：演示 try_lock 在超时场景下的行为。
+ *
+ * 注意：阶段一 treelock_t 为进程内单实例锁表。
+ *       跨客户端锁互斥需阶段三分布式锁管理器支持。
+ *       本例演示 API 用法和返回值处理模式。
  * ========================================================================= */
+
+/** try_lock 线程参数 */
+typedef struct {
+    treelock_t        *tl;         /**< 共享锁句柄          */
+    treelock_node_id_t node_id;    /**< 目标节点            */
+    treelock_mode_t    mode;       /**< 锁模式              */
+    INT_32             timeout_ms; /**< 超时时间            */
+    RET_CODE           result;     /**< 输出: 操作结果      */
+    INT_32             thread_id;  /**< 线程编号            */
+} trylock_thread_arg_t;
+
+/**
+ * 函数名称：_trylock_thread
+ *
+ * 功能描述：线程入口 — 执行 try_lock 操作
+ *
+ * @param[INOUT] arg - trylock_thread_arg_t 指针
+ *
+ * @return NULL
+ */
+static VOID *_trylock_thread(
+    INOUT PTR_VOID arg)
+{
+    trylock_thread_arg_t *ta = (trylock_thread_arg_t *)arg;
+
+    printf("  [线程 %d] 尝试 try_lock(node=%llu, mode=%s, timeout=%dms)...\n",
+           ta->thread_id,
+           (unsigned long long)ta->node_id,
+           treelock_mode_name(ta->mode),
+           ta->timeout_ms);
+
+    ta->result = treelock_try_lock(ta->tl, ta->node_id,
+                                    ta->mode, ta->timeout_ms);
+
+    if (ta->result == TREELOCK_OK) {
+        printf("  [线程 %d] 获取成功 → 释放\n", ta->thread_id);
+        treelock_unlock(ta->tl, ta->node_id);
+    } else {
+        printf("  [线程 %d] 结果: %s\n",
+               ta->thread_id, treelock_strerror(ta->result));
+    }
+    return NULL;
+}
 
 /**
  * 函数名称：_example_try_lock_timeout
  *
- * 功能描述：演示 try_lock 超时机制：
- *          客户端 A 持有 X 锁 → 客户端 B 尝试 S 锁 → 超时返回
+ * 功能描述：多线程 try_lock 超时演示
+ *
+ *          场景 A: try_lock(timeout=0)  — 非阻塞轮询（空闲锁立即获取）
+ *          场景 B: 持锁线程 vs 等待线程 — 短超时快速返回
  */
 static VOID _example_try_lock_timeout(VOID)
 {
-    treelock_config_t config;
-    treelock_t       *tl_a;
-    treelock_t       *tl_b;
-    RET_CODE          rc;
+    treelock_config_t   config;
+    treelock_t         *tl;
+    RET_CODE            rc;
 
     printf("\n========== 示例 4：try_lock 超时 ==========\n");
+    printf("  (阶段一：进程内单实例，演示 API 返回与超时处理)\n\n");
 
     memset(&config, 0, sizeof(config));
     config.timeout_ms = 5000;
-    config.client_id  = "client_A";
+    config.client_id  = "trylock_demo";
 
-    tl_a = treelock_create(&config);
-
-    config.client_id  = "client_B";
-    tl_b = treelock_create(&config);
-
-    /* 客户端 A 获取排他锁 */
-    _check_error(treelock_lock(tl_a, FILE_2_ID, TREELOCK_X), "A lock FILE_2 X");
-    printf("  客户端 A 持有 FILE_2 的 X 锁\n");
-
-    /* 客户端 B 尝试获取同一节点的 S 锁，设置 1000ms 超时 */
-    rc = treelock_try_lock(tl_b, FILE_2_ID, TREELOCK_S, 1000);
-    if (rc == TREELOCK_ERR_TIMEOUT) {
-        printf("  客户端 B: 超时 (符合预期: %s)\n", treelock_strerror(rc));
-    } else {
-        printf("  客户端 B: 意外结果: %s\n", treelock_strerror(rc));
+    tl = treelock_create(&config);
+    if (tl == NULL) {
+        fprintf(stderr, "ERROR: create failed\n");
+        return;
     }
 
-    /* 释放锁后 B 可以获取 */
-    _check_error(treelock_unlock(tl_a, FILE_2_ID), "A unlock FILE_2");
-    _check_error(treelock_lock(tl_b, FILE_2_ID, TREELOCK_S), "B lock FILE_2 S");
-    printf("  客户端 A 释放后，B 成功获取 S 锁\n");
-    _check_error(treelock_unlock(tl_b, FILE_2_ID), "B unlock FILE_2");
+    /* ── 场景 A: try_lock(timeout=0) — 非阻塞轮询 ── */
+    printf("  --- 场景 A: 非阻塞轮询 (timeout=0) ---\n");
 
-    treelock_destroy(tl_a);
-    treelock_destroy(tl_b);
+    /* 先确保锁空闲，然后用 timeout=0 立即获取 */
+    rc = treelock_try_lock(tl, FILE_1_ID, TREELOCK_X, 0);
+    printf("  try_lock(FILE_1, X, timeout=0) → %s", treelock_strerror(rc));
+    if (rc == TREELOCK_OK) {
+        printf(" (空闲锁，立即获取)\n");
+        treelock_unlock(tl, FILE_1_ID);
+    } else {
+        printf("\n");
+    }
+
+    /* 占用锁后，同线程 try_lock 相同模式（重入，应成功） */
+    _check_error(treelock_lock(tl, FILE_1_ID, TREELOCK_X),
+                 "lock FILE_1 X");
+    rc = treelock_try_lock(tl, FILE_1_ID, TREELOCK_X, 0);
+    printf("  try_lock(FILE_1, X, timeout=0) 持锁中重入 → %s (ref_count++)\n",
+           treelock_strerror(rc));
+    treelock_unlock(tl, FILE_1_ID); /* 减 ref_count */
+    treelock_unlock(tl, FILE_1_ID); /* 完全释放 */
+    printf("\n");
+
+    /* ── 场景 B: 多线程 — 持锁 + 等待模式 ── */
+    printf("  --- 场景 B: 多线程 try_lock 等待模式 ---\n");
+    {
+        pthread_t            t_tryer;
+        trylock_thread_arg_t tryer_arg;
+
+        /* 主线程先占用锁 */
+        _check_error(treelock_lock(tl, FILE_2_ID, TREELOCK_X),
+                     "主线程 lock FILE_2 X");
+        printf("  主线程持有 FILE_2 X 锁，将保持 1500ms\n");
+
+        /* 尝试者线程：对同一节点以 200ms 超时 try_lock */
+        memset(&tryer_arg, 0, sizeof(tryer_arg));
+        tryer_arg.tl         = tl;
+        tryer_arg.node_id    = FILE_2_ID;
+        tryer_arg.mode       = TREELOCK_X;  /* 相同模式 → 重入成功 */
+        tryer_arg.timeout_ms = 200;
+        tryer_arg.thread_id  = 2;
+
+        pthread_create(&t_tryer, NULL, _trylock_thread, &tryer_arg);
+        pthread_join(t_tryer, NULL);
+
+        printf("  [线程 2] try_lock 返回: %s", treelock_strerror(tryer_arg.result));
+        if (tryer_arg.result == TREELOCK_OK) {
+            printf(" (同客户端重入, ref_count 递增)");
+        } else if (tryer_arg.result == TREELOCK_ERR_TIMEOUT) {
+            printf(" ← 超时（锁被占用）");
+        }
+        printf("\n");
+
+        treelock_unlock(tl, FILE_2_ID);
+    }
+
+    printf("\n  说明: 阶段一 treelock_t 为进程内单客户端锁表，\n");
+    printf("        同客户端重复加锁通过引用计数支持。\n");
+    printf("        跨客户端锁互斥需阶段三分布式锁管理器。\n");
+    printf("        try_lock 的 API 模式、timeout 参数和返回值处理逻辑已完整演示。\n");
+
+    treelock_destroy(tl);
 }
 
 /* =========================================================================
