@@ -162,6 +162,7 @@ typedef struct {
     treelock_node_id_t  node_id;       /**< 节点 ID                   */
     treelock_mode_t     mode;          /**< 锁模式                     */
     TIMESTAMP_MS        acquired_at;   /**< 获取时间（Unix ms）        */
+    UINT_32             ref_count;     /**< 引用计数（同客户端重入次数） */
 } treelock_held_lock_t;
 
 /* =========================================================================

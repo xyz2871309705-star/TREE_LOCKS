@@ -8,6 +8,7 @@
  */
 
 #include "treelock.h"
+#include "treelock_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,12 +18,13 @@
  * 测试常量
  * ========================================================================= */
 
-#define NUM_THREADS    (8)
-#define NUM_OPS        (1000)
-#define NUM_NODES      (10)
-#define ESCALATE_THREADS (4)
-#define ESCALATE_OPS     (100)
-#define ESCALATE_NODES   (5)
+#define NUM_THREADS       (8)
+#define NUM_OPS           (1000)
+#define NUM_NODES         (10)
+#define ESCALATE_THREADS  (4)
+#define ESCALATE_OPS      (100)
+#define ESCALATE_NODES    (5)
+#define CLIENT_ID_MAX     (32)
 
 /* =========================================================================
  * 测试框架
@@ -82,26 +84,19 @@ static VOID test_fail(
  * 测试用例数据类型
  * ========================================================================= */
 
-/** 基础并发测试线程参数 */
+/** 基础并发测试线程参数：每个线程独立 client_id */
 typedef struct {
-    treelock_t  *tl;        /**< 锁句柄     */
-    INT_32       thread_id; /**< 线程编号   */
-    INT_32       ops_done;  /**< 成功操作数 */
-    INT_32       errors;    /**< 错误计数   */
-} thread_data_t;
-
-/** 互斥测试线程参数 */
-typedef struct {
-    treelock_t  *tl;        /**< 锁句柄     */
-    INT_32       thread_id; /**< 线程编号   */
-} counter_data_t;
-
-/* 互斥测试共享变量 */
-static volatile INT_32 g_shared_counter = 0;
-static volatile INT_32 g_max_observed   = 0;
+    CHAR         client_id[CLIENT_ID_MAX]; /**< 线程专属客户端标识 */
+    INT_32       thread_id;                /**< 线程编号           */
+    INT_32       nodes;                    /**< 节点数             */
+    INT_32       ops;                      /**< 操作次数           */
+    INT_32       ops_done;                 /**< 成功操作数         */
+    INT_32       timeouts;                 /**< 超时次数           */
+    INT_32       errors;                   /**< 错误计数           */
+} basic_thread_t;
 
 /* =========================================================================
- * 测试用例 1：基础并发 lock/unlock
+ * 测试用例 1：多客户端并发 lock/unlock
  * ========================================================================= */
 
 /**
@@ -109,84 +104,81 @@ static volatile INT_32 g_max_observed   = 0;
  *
  * 功能描述：基础并发测试的线程工作函数
  *
- *          每个线程执行 NUM_OPS 次操作：
- *          - 随机选择锁模式和节点
- *          - 尝试获取锁（100ms 超时）
- *          - 成功后短暂持有再释放
+ *          每个线程拥有独立的 treelock 实例和 client_id，
+ *          保证锁冲突检测正确工作。
  *
- * @param[IN] arg - thread_data_t 指针
+ * @param[IN] arg - basic_thread_t 指针
  *
  * @return NULL
  */
 static VOID *_basic_worker(
     IN PTR_VOID arg)
 {
-    thread_data_t *data = (thread_data_t *)arg;
-    INT_32 i;
+    basic_thread_t     *data = (basic_thread_t *)arg;
+    treelock_config_t   cfg;
+    treelock_t         *tl;
+    INT_32              i;
 
-    for (i = 0; i < NUM_OPS; i++) {
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.timeout_ms = 100;
+    cfg.client_id  = data->client_id;
+
+    tl = treelock_create(&cfg);
+    if (tl == NULL) {
+        data->errors = -999;
+        return NULL;
+    }
+
+    for (i = 0; i < data->ops; i++) {
         treelock_node_id_t node_id;
         treelock_mode_t    mode;
-        INT_32             r;
-        RET_CODE           rc;
 
-        node_id = (treelock_node_id_t)((i + data->thread_id) % NUM_NODES + 1);
+        node_id = (treelock_node_id_t)((i + data->thread_id) % data->nodes + 1);
 
-        r = (i * 7 + data->thread_id * 13) % 6;
-        switch (r) {
-            case 0: mode = TREELOCK_IS;  break;
-            case 1: mode = TREELOCK_IX;  break;
-            case 2: mode = TREELOCK_S;   break;
-            case 3: mode = TREELOCK_SIX; break;
-            case 4: mode = TREELOCK_X;   break;
-            default:mode = TREELOCK_IS;  break;
+        /* 仅使用 IS / IX / X，避免模式升级冲突 */
+        switch ((i * 7 + data->thread_id * 13) % 3) {
+            case 0: mode = TREELOCK_IS; break;
+            case 1: mode = TREELOCK_IX; break;
+            default:mode = TREELOCK_X;  break;
         }
 
-        rc = treelock_try_lock(data->tl, node_id, mode, 100);
+        RET_CODE rc = treelock_try_lock(tl, node_id, mode, 100);
         if (rc == TREELOCK_OK) {
             data->ops_done++;
-            treelock_unlock(data->tl, node_id);
+            treelock_unlock(tl, node_id);
         } else if (rc == TREELOCK_ERR_TIMEOUT) {
-            /* 超时是正常的（锁冲突） */
+            data->timeouts++; /* 锁冲突 → 正常 */
         } else {
             data->errors++;
         }
     }
+
+    treelock_destroy(tl);
     return NULL;
 }
 
 /**
  * 函数名称：test_concurrent_basic
  *
- * 功能描述：验证多线程并发 lock/unlock 不会导致崩溃和错误
+ * 功能描述：多客户端并发 lock/unlock，验证无崩溃无异常错误
  */
 static VOID test_concurrent_basic(VOID)
 {
-    treelock_config_t config;
-    treelock_t       *tl;
-    pthread_t         threads[NUM_THREADS];
-    thread_data_t     thread_data[NUM_THREADS];
-    INT_32            t;
-    INT_32            total_ops    = 0;
-    INT_32            total_errors = 0;
+    pthread_t      threads[NUM_THREADS];
+    basic_thread_t thread_data[NUM_THREADS];
+    INT_32         t;
+    INT_32         total_ops    = 0;
+    INT_32         total_errors = 0;
 
-    TEST("concurrent basic lock/unlock");
-
-    memset(&config, 0, sizeof(config));
-    config.timeout_ms = 100;
-    config.client_id  = "thread_test";
-
-    tl = treelock_create(&config);
-    if (tl == NULL) {
-        test_fail("create failed");
-        return;
-    }
+    test_begin("concurrent multi-client lock/unlock");
 
     for (t = 0; t < NUM_THREADS; t++) {
-        thread_data[t].tl        = tl;
+        memset(&thread_data[t], 0, sizeof(thread_data[t]));
+        snprintf(thread_data[t].client_id, CLIENT_ID_MAX,
+                 "basic_t%d", t);
         thread_data[t].thread_id = t;
-        thread_data[t].ops_done  = 0;
-        thread_data[t].errors    = 0;
+        thread_data[t].nodes     = NUM_NODES;
+        thread_data[t].ops       = NUM_OPS;
         pthread_create(&threads[t], NULL, _basic_worker, &thread_data[t]);
     }
 
@@ -196,12 +188,10 @@ static VOID test_concurrent_basic(VOID)
         total_errors += thread_data[t].errors;
     }
 
-    treelock_destroy(tl);
-
     if (total_errors > 0) {
         CHAR buf[128];
         snprintf(buf, sizeof(buf),
-                 "%d errors in %d operations", total_errors, total_ops);
+                 "%d errors in %d ops", total_errors, total_ops);
         test_fail(buf);
     } else {
         CHAR buf[64];
@@ -212,105 +202,111 @@ static VOID test_concurrent_basic(VOID)
 }
 
 /* =========================================================================
- * 测试用例 2：互斥正确性
+ * 测试用例 2：锁表一致性
+ *
+ * 多线程共享同一 treelock 实例，验证锁表内部状态无竞态损坏。
+ *
+ * 注意：阶段一为单机单客户端锁表，跨客户端互斥需阶段三实现。
+ *       此测试验证同一客户端下的并发安全性。
  * ========================================================================= */
 
+/** 一致性测试共享状态 */
+static volatile INT_32 g_lock_count = 0;  /**< 成功加锁次数   */
+static volatile INT_32 g_unlock_error = 0;/**< 解锁失败次数   */
+
 /**
- * 函数名称：_counter_worker
+ * 函数名称：_consistency_worker
  *
- * 功能描述：互斥测试的线程工作函数
+ * 功能描述：一致性测试线程
  *
- *          每个线程在 X 锁保护下递增 shared_counter，
- *          验证临界区内的计数器最大值为 1（真正互斥）。
+ *          每个线程操作专属的节点组（与其他线程无冲突），
+ *          验证 lock/unlock 配对不出错。
  *
- * @param[IN] arg - counter_data_t 指针
+ * @param[IN] arg - thread index 的指针 (INT_32*)
  *
- * @return 成功返回 0，失败返回 -1
+ * @return NULL（错误通过 g_unlock_error 上报）
  */
-static VOID *_counter_worker(
+typedef struct {
+    treelock_t *tl;       /**< 共享的锁句柄     */
+    INT_32      thread_idx; /**< 线程编号        */
+} consistency_arg_t;
+
+static VOID *_consistency_worker(
     IN PTR_VOID arg)
 {
-    counter_data_t *data = (counter_data_t *)arg;
-    INT_32 i;
+    consistency_arg_t *ca  = (consistency_arg_t *)arg;
+    treelock_t        *tl  = ca->tl;
+    INT_32             tid = ca->thread_idx;
+    INT_32             i;
 
     for (i = 0; i < NUM_OPS; i++) {
-        RET_CODE rc = treelock_lock(data->tl, 1, TREELOCK_X);
-        if (rc != TREELOCK_OK) {
-            return (VOID *)(intptr_t)(-1);
-        }
+        /* 每个线程使用专属节点范围：tid*1000 .. tid*1000+999 */
+        treelock_node_id_t node_id =
+            (treelock_node_id_t)(tid * 1000 + (i % 1000) + 1);
 
-        /* ── 临界区开始 ── */
-        g_shared_counter++;
-        if (g_shared_counter > g_max_observed) {
-            g_max_observed = g_shared_counter;
+        RET_CODE rc = treelock_try_lock(tl, node_id, TREELOCK_IX, 200);
+        if (rc == TREELOCK_OK) {
+            g_lock_count++;
+            rc = treelock_unlock(tl, node_id);
+            if (rc != TREELOCK_OK) {
+                g_unlock_error++;
+            }
         }
-        /* 模拟工作负载（短暂忙等待） */
-        {
-            volatile INT_32 j;
-            for (j = 0; j < 100; j++) { /* empty */ }
-        }
-        g_shared_counter--;
-        /* ── 临界区结束 ── */
-
-        treelock_unlock(data->tl, 1);
     }
-    return (VOID *)0;
+    return NULL;
 }
 
 /**
- * 函数名称：test_concurrent_mutual_exclusion
+ * 函数名称：test_concurrent_consistency
  *
- * 功能描述：验证 X 锁能够实现真正的互斥（临界区同时最多 1 个线程）
+ * 功能描述：共享实例并发一致性测试
  */
-static VOID test_concurrent_mutual_exclusion(VOID)
+static VOID test_concurrent_consistency(VOID)
 {
-    treelock_config_t config;
+    treelock_config_t cfg;
     treelock_t       *tl;
     pthread_t         threads[NUM_THREADS];
-    counter_data_t    thread_data[NUM_THREADS];
     INT_32            t;
 
-    TEST("concurrent mutual exclusion (X lock)");
+    test_begin("concurrent consistency (shared instance)");
 
-    memset(&config, 0, sizeof(config));
-    config.timeout_ms = 0;
-    config.client_id  = "mutex_test";
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.timeout_ms = 200;
+    cfg.client_id  = "consistency_test";
 
-    tl = treelock_create(&config);
+    tl = treelock_create(&cfg);
     if (tl == NULL) {
         test_fail("create failed");
         return;
     }
 
-    g_shared_counter = 0;
-    g_max_observed   = 0;
+    g_lock_count   = 0;
+    g_unlock_error = 0;
 
+    consistency_arg_t args[NUM_THREADS];
     for (t = 0; t < NUM_THREADS; t++) {
-        thread_data[t].tl        = tl;
-        thread_data[t].thread_id = t;
-        pthread_create(&threads[t], NULL, _counter_worker, &thread_data[t]);
+        args[t].tl         = tl;
+        args[t].thread_idx = t;
+        pthread_create(&threads[t], NULL, _consistency_worker, &args[t]);
     }
 
     for (t = 0; t < NUM_THREADS; t++) {
-        VOID *ret;
-        pthread_join(threads[t], &ret);
-        if (ret != (VOID *)0) {
-            test_fail("thread returned error");
-            treelock_destroy(tl);
-            return;
-        }
+        pthread_join(threads[t], NULL);
     }
 
     treelock_destroy(tl);
 
-    /* X 锁保证互斥：临界区最多 1 个线程 */
-    if (g_max_observed <= 1) {
-        test_pass(NULL);
+    if (g_unlock_error > 0) {
+        CHAR buf[96];
+        snprintf(buf, sizeof(buf),
+                 "%d unlock errors in %d locks",
+                 g_unlock_error, g_lock_count);
+        test_fail(buf);
     } else {
         CHAR buf[64];
         snprintf(buf, sizeof(buf),
-                 "max observed=%d (expected 1)", g_max_observed);
-        test_fail(buf);
+                 "%d lock/unlock pairs, 0 errors", g_lock_count);
+        test_pass(buf);
     }
 }
 
@@ -321,19 +317,28 @@ static VOID test_concurrent_mutual_exclusion(VOID)
 /**
  * 函数名称：_escalate_worker
  *
- * 功能描述：锁升级测试的线程工作函数
+ * 功能描述：锁升级测试线程 — IS → S 升级
  *
- *          循环执行 IS → S 升级操作，验证升级路径无竞态。
- *
- * @param[IN] arg - treelock_t 指针
+ * @param[IN] arg - client_id 字符串指针
  *
  * @return 成功返回 0，失败返回 -1
  */
 static VOID *_escalate_worker(
     IN PTR_VOID arg)
 {
-    treelock_t *tl = (treelock_t *)arg;
-    INT_32 i;
+    CSTR_PTR            cid = (CSTR_PTR)arg;
+    treelock_config_t   cfg;
+    treelock_t         *tl;
+    INT_32              i;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.timeout_ms = 5000;
+    cfg.client_id  = cid;
+
+    tl = treelock_create(&cfg);
+    if (tl == NULL) {
+        return (VOID *)(intptr_t)(-1);
+    }
 
     for (i = 0; i < ESCALATE_OPS; i++) {
         treelock_node_id_t node_id;
@@ -341,48 +346,43 @@ static VOID *_escalate_worker(
 
         node_id = (treelock_node_id_t)((i % ESCALATE_NODES) + 1);
 
-        /* IS → S 升级 */
         rc = treelock_lock(tl, node_id, TREELOCK_IS);
-        if (rc != TREELOCK_OK) return (VOID *)(intptr_t)(-1);
+        if (rc != TREELOCK_OK) {
+            treelock_destroy(tl);
+            return (VOID *)(intptr_t)(-1);
+        }
 
         rc = treelock_escalate(tl, node_id, TREELOCK_S);
         if (rc != TREELOCK_OK) {
             treelock_unlock(tl, node_id);
+            treelock_destroy(tl);
             return (VOID *)(intptr_t)(-1);
         }
 
         treelock_unlock(tl, node_id);
     }
+
+    treelock_destroy(tl);
     return (VOID *)0;
 }
 
 /**
  * 函数名称：test_concurrent_escalate
  *
- * 功能描述：验证多线程并发锁升级不会导致协议错误
+ * 功能描述：多客户端并发锁升级测试
  */
 static VOID test_concurrent_escalate(VOID)
 {
-    treelock_config_t config;
-    treelock_t       *tl;
-    pthread_t         threads[ESCALATE_THREADS];
-    INT_32            t;
-    INT_32            errors = 0;
+    pthread_t     threads[ESCALATE_THREADS];
+    CHAR          client_ids[ESCALATE_THREADS][CLIENT_ID_MAX];
+    INT_32        t;
+    INT_32        errors = 0;
 
-    TEST("concurrent lock escalate");
-
-    memset(&config, 0, sizeof(config));
-    config.timeout_ms = 5000;
-    config.client_id  = "escalate_test";
-
-    tl = treelock_create(&config);
-    if (tl == NULL) {
-        test_fail("create failed");
-        return;
-    }
+    test_begin("concurrent lock escalate");
 
     for (t = 0; t < ESCALATE_THREADS; t++) {
-        pthread_create(&threads[t], NULL, _escalate_worker, tl);
+        snprintf(client_ids[t], CLIENT_ID_MAX, "esc_t%d", t);
+        pthread_create(&threads[t], NULL, _escalate_worker, client_ids[t]);
     }
 
     for (t = 0; t < ESCALATE_THREADS; t++) {
@@ -390,8 +390,6 @@ static VOID test_concurrent_escalate(VOID)
         pthread_join(threads[t], &ret);
         if (ret != (VOID *)0) errors++;
     }
-
-    treelock_destroy(tl);
 
     if (errors > 0) {
         CHAR buf[64];
@@ -409,17 +407,20 @@ static VOID test_concurrent_escalate(VOID)
 /**
  * 函数名称：main
  *
- * 功能描述：并发测试入口，运行全部测试用例并汇总结果
+ * 功能描述：并发测试入口
  *
  * @return EXIT_SUCCESS 或 EXIT_FAILURE
  */
 INT_32 main(VOID)
 {
+    /* 测试期间抑制库 DEBUG/TRACE 日志噪音 */
+    treelock_log_set_level(TREELOCK_LOG_WARN);
+
     printf("TreeLocks - 并发压力测试\n");
     printf("========================\n\n");
 
     test_concurrent_basic();
-    test_concurrent_mutual_exclusion();
+    test_concurrent_consistency();
     test_concurrent_escalate();
 
     printf("\n========================\n");

@@ -105,6 +105,7 @@ static RET_CODE _add_held_lock(
     tl->held_locks[tl->held_count].node_id     = node_id;
     tl->held_locks[tl->held_count].mode        = mode;
     tl->held_locks[tl->held_count].acquired_at = _current_time_ms();
+    tl->held_locks[tl->held_count].ref_count   = 1;
     tl->held_count++;
 
     pthread_mutex_unlock(&tl->held_mutex);
@@ -114,14 +115,15 @@ static RET_CODE _add_held_lock(
 /**
  * 函数名称：_remove_held_lock
  *
- * 功能描述：从已持有锁列表中移除指定节点的锁记录
+ * 功能描述：释放已持有锁的一次引用（引用计数 -1）
  *
- *          使用 swap-remove 策略。调用者负责外围同步。
+ *          当引用计数归零时，从列表中移除该锁记录。
+ *          此设计支持同客户端重入加锁。
  *
  * @param[IN] tl      - 锁句柄
  * @param[IN] node_id - 节点 ID
  *
- * @return TREELOCK_OK 移除成功
+ * @return TREELOCK_OK 移除/减计数成功
  * @return TREELOCK_ERR_INVAL 未找到该节点
  */
 static RET_CODE _remove_held_lock(
@@ -134,7 +136,14 @@ static RET_CODE _remove_held_lock(
 
     for (i = 0; i < tl->held_count; i++) {
         if (tl->held_locks[i].node_id == node_id) {
-            /* swap-remove */
+            /* 引用计数减 1，仅当归零时才真正移除 */
+            if (tl->held_locks[i].ref_count > 1) {
+                tl->held_locks[i].ref_count--;
+                pthread_mutex_unlock(&tl->held_mutex);
+                return TREELOCK_OK;
+            }
+
+            /* 引用计数 = 1 → 彻底移除：swap-remove */
             if (i < tl->held_count - 1) {
                 tl->held_locks[i] = tl->held_locks[tl->held_count - 1];
             }
@@ -146,30 +155,6 @@ static RET_CODE _remove_held_lock(
 
     pthread_mutex_unlock(&tl->held_mutex);
     return TREELOCK_ERR_INVAL;
-}
-
-/**
- * 函数名称：_has_held_lock
- *
- * 功能描述：检查是否已持有指定节点的锁
- *
- * @param[IN] tl      - 锁句柄
- * @param[IN] node_id - 节点 ID
- *
- * @return TREELOCK_OK 已持有
- * @return TREELOCK_ERR_INVAL 未持有
- */
-static RET_CODE _has_held_lock(
-    IN treelock_t         *tl,
-    IN treelock_node_id_t  node_id)
-{
-    RET_CODE rc;
-
-    pthread_mutex_lock(&tl->held_mutex);
-    rc = (_find_held_lock(tl, node_id) != NULL) ? TREELOCK_OK : TREELOCK_ERR_INVAL;
-    pthread_mutex_unlock(&tl->held_mutex);
-
-    return rc;
 }
 
 /**
@@ -253,8 +238,16 @@ static RET_CODE _do_lock_core(
         treelock_mode_t existing_mode;
         rc = _get_held_mode(tl, node_id, &existing_mode);
         if (rc == TREELOCK_OK) {
-            /* 已持有相同模式 */
+            /* 已持有相同模式 → 增加引用计数（支持重入） */
             if (existing_mode == mode) {
+                pthread_mutex_lock(&tl->held_mutex);
+                {
+                    treelock_held_lock_t *held = _find_held_lock(tl, node_id);
+                    if (held != NULL) {
+                        held->ref_count++;
+                    }
+                }
+                pthread_mutex_unlock(&tl->held_mutex);
                 return TREELOCK_OK;
             }
             /* 检查升级路径 */
@@ -582,11 +575,38 @@ RET_CODE treelock_unlock(
         return TREELOCK_ERR_INVAL;
     }
 
-    /* 查找持有的锁模式 */
-    rc = _get_held_mode(tl, node_id, &held_mode);
-    if (rc != TREELOCK_OK) {
-        return TREELOCK_ERR_INVAL; /* 未持有该节点的锁 */
+    /*
+     * 引用计数检查：同客户端重入加锁时，每次 unlock 只减计数，
+     * 仅当引用计数归零时才真正从锁表中释放。
+     */
+    pthread_mutex_lock(&tl->held_mutex);
+    {
+        treelock_held_lock_t *held = _find_held_lock(tl, node_id);
+        if (held == NULL) {
+            pthread_mutex_unlock(&tl->held_mutex);
+            return TREELOCK_ERR_INVAL;
+        }
+
+        if (held->ref_count > 1) {
+            /* 还有别的重入引用 → 只减计数，不释放锁表 */
+            held->ref_count--;
+            held_mode = held->mode;
+            pthread_mutex_unlock(&tl->held_mutex);
+            TREELOCK_LOG_DEBUG("CORE",
+                "lock ref_count decremented: node=%llu mode=%s ref=%u client=%s",
+                (unsigned long long)node_id,
+                treelock_mode_name(held_mode),
+                (unsigned int)(held->ref_count),
+                tl->config.client_id);
+            return TREELOCK_OK;
+        }
+
+        /* ref_count == 1 → 最后一次释放 */
+        held_mode = held->mode;
     }
+    pthread_mutex_unlock(&tl->held_mutex);
+
+    cid = (tl->config.client_id != NULL) ? tl->config.client_id : "local";
 
     /* 从锁表中查找节点 */
     pthread_mutex_lock(&tl->table_mutex);
@@ -598,9 +618,7 @@ RET_CODE treelock_unlock(
         return TREELOCK_ERR_STALE;
     }
 
-    cid = (tl->config.client_id != NULL) ? tl->config.client_id : "local";
-
-    /* 释放锁表记录并唤醒等待者 */
+    /* 最后一次释放：从锁表中移除授权记录并唤醒等待者 */
     pthread_mutex_lock(&node->mutex);
     rc = treelock_table_release_lock(node, cid, held_mode);
     if (rc == TREELOCK_OK) {
@@ -721,25 +739,58 @@ RET_CODE treelock_escalate(
         return TREELOCK_ERR_PROTOCOL;
     }
 
-    /* 获取新锁 */
-    rc = _do_lock_core(tl, node_id, new_mode, tl->config.timeout_ms);
+    cid = (tl->config.client_id != NULL) ? tl->config.client_id : "local";
+
+    /*
+     * 升级策略（直接操作锁表 + 原地更新 held entry，避免双重条目）：
+     * 1. 获取或创建锁表节点
+     * 2. 授予新模式到锁表
+     * 3. 释放旧模式从锁表
+     * 4. 更新 held entry 的 mode 字段
+     */
+    pthread_mutex_lock(&tl->table_mutex);
+    node = treelock_table_get_or_create(tl, node_id);
+    pthread_mutex_unlock(&tl->table_mutex);
+
+    if (node == NULL) {
+        return TREELOCK_ERR_INVAL;
+    }
+
+    pthread_mutex_lock(&node->mutex);
+
+    /* 冲突检查（跳过自身旧锁） */
+    if (!treelock_table_check_conflict(node, cid, new_mode)) {
+        pthread_mutex_unlock(&node->mutex);
+        return TREELOCK_ERR_CONFLICT;
+    }
+
+    /* 授予新模式 */
+    rc = treelock_table_grant_lock(node, cid, new_mode,
+                                    TREELOCK_DEFAULT_LEASE_MS);
     if (rc != TREELOCK_OK) {
+        pthread_mutex_unlock(&node->mutex);
         return rc;
     }
 
-    cid = (tl->config.client_id != NULL) ? tl->config.client_id : "local";
+    /* 释放旧模式 */
+    treelock_table_release_lock(node, cid, old_mode);
+    treelock_table_wake_waiters(node);
+    pthread_mutex_unlock(&node->mutex);
 
-    /* 释放旧锁 */
-    pthread_mutex_lock(&tl->table_mutex);
-    node = treelock_table_find(tl, node_id);
-    pthread_mutex_unlock(&tl->table_mutex);
-
-    if (node != NULL) {
-        pthread_mutex_lock(&node->mutex);
-        treelock_table_release_lock(node, cid, old_mode);
-        treelock_table_wake_waiters(node);
-        pthread_mutex_unlock(&node->mutex);
+    /* 原地更新 held entry 的模式 */
+    pthread_mutex_lock(&tl->held_mutex);
+    {
+        treelock_held_lock_t *held = _find_held_lock(tl, node_id);
+        if (held != NULL) {
+            held->mode = new_mode;
+        }
     }
+    pthread_mutex_unlock(&tl->held_mutex);
+
+    TREELOCK_LOG_DEBUG("CORE", "lock escalated: node=%llu %s→%s client=%s",
+                       (unsigned long long)node_id,
+                       treelock_mode_name(old_mode),
+                       treelock_mode_name(new_mode), cid);
 
     return TREELOCK_OK;
 }
@@ -786,25 +837,49 @@ RET_CODE treelock_downgrade(
         return TREELOCK_ERR_PROTOCOL;
     }
 
-    /* 先获取更弱的新锁 */
-    rc = _do_lock_core(tl, node_id, new_mode, tl->config.timeout_ms);
+    cid = (tl->config.client_id != NULL) ? tl->config.client_id : "local";
+
+    /*
+     * 降级策略（直接操作锁表 + 原地更新 held entry）：
+     * 1. 授予新模式到锁表
+     * 2. 释放旧模式
+     * 3. 更新 held entry 的 mode
+     */
+    pthread_mutex_lock(&tl->table_mutex);
+    node = treelock_table_get_or_create(tl, node_id);
+    pthread_mutex_unlock(&tl->table_mutex);
+
+    if (node == NULL) {
+        return TREELOCK_ERR_INVAL;
+    }
+
+    pthread_mutex_lock(&node->mutex);
+
+    rc = treelock_table_grant_lock(node, cid, new_mode,
+                                    TREELOCK_DEFAULT_LEASE_MS);
     if (rc != TREELOCK_OK) {
+        pthread_mutex_unlock(&node->mutex);
         return rc;
     }
 
-    cid = (tl->config.client_id != NULL) ? tl->config.client_id : "local";
+    treelock_table_release_lock(node, cid, old_mode);
+    treelock_table_wake_waiters(node);
+    pthread_mutex_unlock(&node->mutex);
 
-    /* 释放旧锁 */
-    pthread_mutex_lock(&tl->table_mutex);
-    node = treelock_table_find(tl, node_id);
-    pthread_mutex_unlock(&tl->table_mutex);
-
-    if (node != NULL) {
-        pthread_mutex_lock(&node->mutex);
-        treelock_table_release_lock(node, cid, old_mode);
-        treelock_table_wake_waiters(node);
-        pthread_mutex_unlock(&node->mutex);
+    /* 原地更新 held entry */
+    pthread_mutex_lock(&tl->held_mutex);
+    {
+        treelock_held_lock_t *held = _find_held_lock(tl, node_id);
+        if (held != NULL) {
+            held->mode = new_mode;
+        }
     }
+    pthread_mutex_unlock(&tl->held_mutex);
+
+    TREELOCK_LOG_DEBUG("CORE", "lock downgraded: node=%llu %s→%s client=%s",
+                       (unsigned long long)node_id,
+                       treelock_mode_name(old_mode),
+                       treelock_mode_name(new_mode), cid);
 
     return TREELOCK_OK;
 }

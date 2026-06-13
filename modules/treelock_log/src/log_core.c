@@ -120,8 +120,11 @@ VOID _log_format_timestamp(
 
     gettimeofday(&tv, NULL);
 #ifdef _WIN32
-    /* Windows: localtime_s */
-    localtime_s(&tm_info, &tv.tv_sec);
+    /* Windows: localtime_s — time_t 在 MinGW 中是 64 位，需显式转换 */
+    {
+        time_t sec = (time_t)tv.tv_sec;
+        localtime_s(&tm_info, &sec);
+    }
 #else
     /* POSIX: localtime_r */
     localtime_r(&tv.tv_sec, &tm_info);
@@ -362,16 +365,19 @@ VOID treelock_log_write_va(
               (fmt != NULL) ? fmt : "", args);
     msg_buf[sizeof(msg_buf) - 1] = '\0';
 
-    /* ── 递归保护（防止回调中再次写日志导致死锁） ── */
+    /* ── 加锁 ── */
+    pthread_mutex_lock(&g_log_ctx.mutex);
+
+    /*
+     * ── 递归保护（防止回调中再次写日志导致死锁） ──
+     * 必须在加锁之后检查：保证线程安全。
+     */
     if (g_log_ctx.recursion_guard) {
-        /* 递归调用：直接写到 stderr 避免死锁 */
+        pthread_mutex_unlock(&g_log_ctx.mutex);
         fprintf(stderr, "[RECURSIVE LOG] [%s] %s\n",
                 g_level_names[level], msg_buf);
         return;
     }
-
-    /* ── 加锁 ── */
-    pthread_mutex_lock(&g_log_ctx.mutex);
     g_log_ctx.recursion_guard = TRUE;
 
     /* ── 调用回调 ── */

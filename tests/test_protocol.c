@@ -8,6 +8,7 @@
  */
 
 #include "treelock.h"
+#include "treelock_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -363,6 +364,9 @@ static VOID test_strerror(VOID)
  */
 INT_32 main(VOID)
 {
+    /* 测试期间抑制库的 DEBUG/TRACE 日志噪音 */
+    treelock_log_set_level(TREELOCK_LOG_WARN);
+
     printf("TreeLocks - 协议正确性测试\n");
     printf("==========================\n\n");
 

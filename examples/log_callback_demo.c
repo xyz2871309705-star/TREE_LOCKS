@@ -58,6 +58,8 @@ static VOID _my_file_log_callback(
     CHAR              time_buf[32];
     time_t            now;
 
+    UNUSED_PARAM(func_name);
+
     if (ctx == NULL || ctx->file_handle == NULL) {
         return;
     }

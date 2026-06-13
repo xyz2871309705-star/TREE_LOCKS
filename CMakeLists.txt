@@ -9,8 +9,9 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 # 编译警告
+# 注意：不使用 -Wpedantic，因为日志宏依赖 GNU 扩展 ##__VA_ARGS__
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion)
+    add_compile_options(-Wall -Wextra -Wshadow -Wconversion)
 endif()
 
 if(MSVC)
