@@ -105,7 +105,11 @@ INT_32 treelock_mode_compatible(
     IN treelock_mode_t existing,
     IN treelock_mode_t requested)
 {
-    if (existing > TREELOCK_MODE_MAX || requested > TREELOCK_MODE_MAX) {
+    if (existing < TREELOCK_NL || existing > TREELOCK_MODE_MAX ||
+        requested < TREELOCK_NL || requested > TREELOCK_MODE_MAX) {
+        TREELOCK_LOG_WARN("PROTO",
+            "mode_compatible: invalid mode existing=%d requested=%d",
+            (INT_32)existing, (INT_32)requested);
         return FALSE;
     }
     return g_compat_matrix[existing][requested];
@@ -123,7 +127,9 @@ INT_32 treelock_mode_compatible(
 treelock_mode_t treelock_required_parent_mode(
     IN treelock_mode_t mode)
 {
-    if (mode > TREELOCK_MODE_MAX) {
+    if (mode < TREELOCK_NL || mode > TREELOCK_MODE_MAX) {
+        TREELOCK_LOG_WARN("PROTO",
+            "required_parent_mode: invalid mode=%d", (INT_32)mode);
         return TREELOCK_NL;
     }
     return g_required_parent[mode];
@@ -145,7 +151,11 @@ INT_32 treelock_escalate_valid(
     IN treelock_mode_t old_mode,
     IN treelock_mode_t new_mode)
 {
-    if (old_mode > TREELOCK_MODE_MAX || new_mode > TREELOCK_MODE_MAX) {
+    if (old_mode < TREELOCK_NL || old_mode > TREELOCK_MODE_MAX ||
+        new_mode < TREELOCK_NL || new_mode > TREELOCK_MODE_MAX) {
+        TREELOCK_LOG_WARN("PROTO",
+            "escalate_valid: invalid mode old=%d new=%d",
+            (INT_32)old_mode, (INT_32)new_mode);
         return FALSE;
     }
     if (old_mode == new_mode) {
@@ -170,7 +180,11 @@ INT_32 treelock_downgrade_valid(
     IN treelock_mode_t old_mode,
     IN treelock_mode_t new_mode)
 {
-    if (old_mode > TREELOCK_MODE_MAX || new_mode > TREELOCK_MODE_MAX) {
+    if (old_mode < TREELOCK_NL || old_mode > TREELOCK_MODE_MAX ||
+        new_mode < TREELOCK_NL || new_mode > TREELOCK_MODE_MAX) {
+        TREELOCK_LOG_WARN("PROTO",
+            "downgrade_valid: invalid mode old=%d new=%d",
+            (INT_32)old_mode, (INT_32)new_mode);
         return FALSE;
     }
     if (old_mode == new_mode) {
@@ -194,7 +208,7 @@ CSTR_PTR treelock_mode_name(
     static const CHAR *names[] = {
         "NL", "IS", "IX", "S", "SIX", "X"
     };
-    if (mode > TREELOCK_MODE_MAX) {
+    if (mode < TREELOCK_NL || mode > TREELOCK_MODE_MAX) {
         return "UNKNOWN";
     }
     return names[mode];
@@ -300,6 +314,11 @@ RET_CODE treelock_validate_protocol(
             return TREELOCK_ERR_PROTOCOL;
         }
     }
+
+    TREELOCK_LOG_TRACE("PROTO",
+        "protocol valid: node=%llu mode=%s parent=%llu holds=%s",
+        (unsigned long long)node_id, treelock_mode_name(mode),
+        (unsigned long long)parent_id, treelock_mode_name(held));
 
     return TREELOCK_OK;
 }

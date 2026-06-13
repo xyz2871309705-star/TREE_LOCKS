@@ -85,6 +85,9 @@ RET_CODE treelock_resolve_path(
     /* 根节点总是在路径上 */
     ids[count++] = current->node_id;
 
+    TREELOCK_LOG_TRACE("TREE", "resolve_path: root_id=%llu path=%s",
+                       (unsigned long long)current->node_id, path);
+
     /* 跳过开头的 '/' */
     p = path;
     if (*p == '/') {
@@ -199,6 +202,10 @@ RET_CODE treelock_resolve_path(
 
             ids[count++] = child->node_id;
             current = child;
+            TREELOCK_LOG_TRACE("TREE",
+                "resolve_path: segment '%s' → node_id=%llu (step %u)",
+                seg_buf, (unsigned long long)child->node_id,
+                (unsigned int)count - 1);
         }
 
         /* 移到下一段 */

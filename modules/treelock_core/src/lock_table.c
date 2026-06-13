@@ -72,7 +72,13 @@ treelock_node_t *treelock_table_find(
     IN treelock_t         *tl,
     IN treelock_node_id_t  node_id)
 {
-    treelock_node_t *node = tl->lock_table;
+    treelock_node_t *node;
+
+    if (tl == NULL) {
+        return NULL;
+    }
+
+    node = tl->lock_table;
     while (node != NULL) {
         if (node->node_id == node_id) {
             return node;
@@ -98,7 +104,13 @@ treelock_node_t *treelock_table_get_or_create(
     IN treelock_t         *tl,
     IN treelock_node_id_t  node_id)
 {
-    treelock_node_t *node = treelock_table_find(tl, node_id);
+    treelock_node_t *node;
+
+    if (tl == NULL) {
+        return NULL;
+    }
+
+    node = treelock_table_find(tl, node_id);
     if (node != NULL) {
         return node;
     }
@@ -106,6 +118,9 @@ treelock_node_t *treelock_table_get_or_create(
     /* 分配新节点并零初始化 */
     node = (treelock_node_t *)calloc(1, sizeof(treelock_node_t));
     if (node == NULL) {
+        TREELOCK_LOG_ERROR("TABLE",
+            "failed to allocate node for node_id=%llu (OOM)",
+            (unsigned long long)node_id);
         return NULL;
     }
 
@@ -113,6 +128,9 @@ treelock_node_t *treelock_table_get_or_create(
 
     /* 初始化节点级互斥锁 */
     if (pthread_mutex_init(&node->mutex, NULL) != 0) {
+        TREELOCK_LOG_ERROR("TABLE",
+            "failed to init mutex for node_id=%llu",
+            (unsigned long long)node_id);
         free(node);
         return NULL;
     }
@@ -121,6 +139,8 @@ treelock_node_t *treelock_table_get_or_create(
     node->next = tl->lock_table;
     tl->lock_table = node;
 
+    TREELOCK_LOG_DEBUG("TABLE", "new node created: node_id=%llu",
+                       (unsigned long long)node_id);
     return node;
 }
 
@@ -147,6 +167,10 @@ INT_32 treelock_table_check_conflict(
 {
     UINT_64 i;
 
+    if (node == NULL || client_id == NULL) {
+        return FALSE;
+    }
+
     for (i = 0; i < node->grant_count; i++) {
         treelock_grant_t *grant = &node->grants[i];
 
@@ -158,11 +182,22 @@ INT_32 treelock_table_check_conflict(
         /* 检查租约过期（永不过期 = -1） */
         if (grant->lease_expire_at > 0 &&
             _current_time_ms() >= grant->lease_expire_at) {
+            TREELOCK_LOG_TRACE("TABLE",
+                "expired lease ignored: node=%llu mode=%s client=%s",
+                (unsigned long long)node->node_id,
+                treelock_mode_name(grant->mode),
+                grant->client_id);
             continue; /* 过期锁视为不存在 */
         }
 
         /* 兼容性检查 */
         if (!treelock_mode_compatible(grant->mode, mode)) {
+            TREELOCK_LOG_TRACE("TABLE",
+                "conflict: existing=%s requested=%s client=%s on node=%llu",
+                treelock_mode_name(grant->mode),
+                treelock_mode_name(mode),
+                grant->client_id,
+                (unsigned long long)node->node_id);
             return FALSE; /* 冲突 */
         }
     }
@@ -190,6 +225,10 @@ RET_CODE treelock_table_grant_lock(
     IN treelock_mode_t  mode,
     IN INT_64           lease_ms)
 {
+    if (node == NULL || client_id == NULL) {
+        return TREELOCK_ERR_INVAL;
+    }
+
     /* 扩展 grants 数组 */
     if (node->grant_count >= node->grant_capacity) {
         UINT_64 new_cap;
@@ -202,6 +241,11 @@ RET_CODE treelock_table_grant_lock(
         new_grants = (treelock_grant_t *)realloc(
             node->grants, (size_t)(new_cap * sizeof(treelock_grant_t)));
         if (new_grants == NULL) {
+            TREELOCK_LOG_ERROR("TABLE",
+                "failed to expand grants: node=%llu cap=%llu→%llu (OOM)",
+                (unsigned long long)node->node_id,
+                (unsigned long long)node->grant_capacity,
+                (unsigned long long)new_cap);
             return TREELOCK_ERR_INVAL; /* OOM */
         }
         node->grants = new_grants;
@@ -247,6 +291,10 @@ RET_CODE treelock_table_release_lock(
 {
     UINT_64 i;
 
+    if (node == NULL || client_id == NULL) {
+        return TREELOCK_ERR_INVAL;
+    }
+
     for (i = 0; i < node->grant_count; i++) {
         treelock_grant_t *grant = &node->grants[i];
 
@@ -257,6 +305,12 @@ RET_CODE treelock_table_release_lock(
                 node->grants[i] = node->grants[node->grant_count - 1];
             }
             node->grant_count--;
+            TREELOCK_LOG_TRACE("TABLE",
+                "lock released from grants: node=%llu mode=%s client=%s "
+                "(grant_count=%llu)",
+                (unsigned long long)node->node_id,
+                treelock_mode_name(mode), client_id,
+                (unsigned long long)node->grant_count);
             return TREELOCK_OK;
         }
     }
@@ -283,6 +337,10 @@ RET_CODE treelock_table_add_waiter(
     IN CSTR_PTR         client_id,
     IN treelock_mode_t  mode)
 {
+    if (node == NULL || client_id == NULL) {
+        return TREELOCK_ERR_INVAL;
+    }
+
     /* 扩展队列 */
     if (node->wait_count >= node->wait_capacity) {
         UINT_64 new_cap;
@@ -296,6 +354,11 @@ RET_CODE treelock_table_add_waiter(
             node->wait_queue,
             (size_t)(new_cap * sizeof(treelock_wait_entry_t)));
         if (new_queue == NULL) {
+            TREELOCK_LOG_ERROR("TABLE",
+                "failed to expand wait queue: node=%llu cap=%llu→%llu (OOM)",
+                (unsigned long long)node->node_id,
+                (unsigned long long)node->wait_capacity,
+                (unsigned long long)new_cap);
             return TREELOCK_ERR_INVAL;
         }
         node->wait_queue = new_queue;
@@ -310,11 +373,21 @@ RET_CODE treelock_table_add_waiter(
         entry->enqueue_time   = _current_time_ms();
 
         if (pthread_cond_init(&entry->cond, NULL) != 0) {
+            TREELOCK_LOG_ERROR("TABLE",
+                "failed to init cond for waiter: node=%llu client=%s",
+                (unsigned long long)node->node_id, client_id);
             return TREELOCK_ERR_INVAL;
         }
     }
 
     node->wait_count++;
+    TREELOCK_LOG_TRACE("TABLE",
+        "waiter added: node=%llu mode=%s client=%s "
+        "(wait_count=%llu wait_capacity=%llu)",
+        (unsigned long long)node->node_id,
+        treelock_mode_name(mode), client_id,
+        (unsigned long long)node->wait_count,
+        (unsigned long long)node->wait_capacity);
     return TREELOCK_OK;
 }
 
@@ -335,6 +408,10 @@ VOID treelock_table_wake_waiters(
 {
     UINT_64 i;
 
+    if (node == NULL) {
+        return;
+    }
+
     for (i = 0; i < node->wait_count; /* 循环内更新 */) {
         treelock_wait_entry_t *entry = &node->wait_queue[i];
 
@@ -346,12 +423,33 @@ VOID treelock_table_wake_waiters(
                                        TREELOCK_DEFAULT_LEASE_MS);
 
             /* 唤醒等待者 */
+            TREELOCK_LOG_TRACE("TABLE",
+                "waking waiter: node=%llu mode=%s client=%s",
+                (unsigned long long)node->node_id,
+                treelock_mode_name(entry->requested_mode),
+                entry->client_id);
             pthread_cond_signal(&entry->cond);
-            pthread_cond_destroy(&entry->cond);
+            /*
+             * 注意：不在此处 pthread_cond_destroy，因为被唤醒的线程
+             * 可能尚未从 pthread_cond_wait 完全返回（仍在等待重新获取
+             * node->mutex）。cond 由 _do_lock_core 中被唤醒的线程在
+             * 成功获取锁后负责销毁（或超时路径自行销毁）。
+             * 未使用的 cond 在 treelock_destroy 的清理循环中释放。
+             */
 
-            /* swap-remove 从队列中移除 */
+            /* swap-remove 从队列中移除（逐字段拷贝，避免 pthread_cond_t 整体赋值） */
             if (i < node->wait_count - 1) {
-                node->wait_queue[i] = node->wait_queue[node->wait_count - 1];
+                memcpy(node->wait_queue[i].client_id,
+                       node->wait_queue[node->wait_count - 1].client_id,
+                       TREELOCK_CLIENT_ID_MAX);
+                node->wait_queue[i].requested_mode =
+                    node->wait_queue[node->wait_count - 1].requested_mode;
+                node->wait_queue[i].enqueue_time =
+                    node->wait_queue[node->wait_count - 1].enqueue_time;
+                /*
+                 * cond 不拷贝：保留位置 i 原有的 cond（已由 _do_lock_core
+                 * 中被唤醒的线程负责销毁，或由 treelock_destroy 清理）。
+                 */
             }
             node->wait_count--;
             /* 不递增 i：当前位置已替换为新元素，需重新检查 */

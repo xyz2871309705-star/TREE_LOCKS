@@ -52,6 +52,11 @@ static treelock_held_lock_t *_find_held_lock(
     IN treelock_node_id_t  node_id)
 {
     UINT_64 i;
+
+    if (tl == NULL) {
+        return NULL;
+    }
+
     for (i = 0; i < tl->held_count; i++) {
         if (tl->held_locks[i].node_id == node_id) {
             return &tl->held_locks[i];
@@ -80,6 +85,10 @@ static RET_CODE _add_held_lock(
     IN treelock_node_id_t  node_id,
     IN treelock_mode_t     mode)
 {
+    if (tl == NULL) {
+        return TREELOCK_ERR_INVAL;
+    }
+
     pthread_mutex_lock(&tl->held_mutex);
 
     /* 扩展数组 */
@@ -96,6 +105,10 @@ static RET_CODE _add_held_lock(
             (size_t)(new_cap * sizeof(treelock_held_lock_t)));
         if (new_held == NULL) {
             pthread_mutex_unlock(&tl->held_mutex);
+            TREELOCK_LOG_ERROR("CORE",
+                "failed to expand held_locks from %llu to %llu (OOM)",
+                (unsigned long long)tl->held_capacity,
+                (unsigned long long)new_cap);
             return TREELOCK_ERR_INVAL;
         }
         tl->held_locks = new_held;
@@ -131,6 +144,10 @@ static RET_CODE _remove_held_lock(
     IN treelock_node_id_t  node_id)
 {
     UINT_64 i;
+
+    if (tl == NULL) {
+        return TREELOCK_ERR_INVAL;
+    }
 
     pthread_mutex_lock(&tl->held_mutex);
 
@@ -175,6 +192,10 @@ static RET_CODE _get_held_mode(
     OUT treelock_mode_t    *mode)
 {
     RET_CODE rc = TREELOCK_ERR_INVAL;
+
+    if (tl == NULL || mode == NULL) {
+        return TREELOCK_ERR_INVAL;
+    }
 
     pthread_mutex_lock(&tl->held_mutex);
     {
@@ -245,6 +266,12 @@ static RET_CODE _do_lock_core(
                     treelock_held_lock_t *held = _find_held_lock(tl, node_id);
                     if (held != NULL) {
                         held->ref_count++;
+                        TREELOCK_LOG_DEBUG("CORE",
+                            "lock re-entrant: node=%llu mode=%s ref=%u client=%s",
+                            (unsigned long long)node_id,
+                            treelock_mode_name(mode),
+                            (unsigned int)(held->ref_count),
+                            tl->config.client_id);
                     }
                 }
                 pthread_mutex_unlock(&tl->held_mutex);
@@ -252,6 +279,12 @@ static RET_CODE _do_lock_core(
             }
             /* 检查升级路径 */
             if (!treelock_escalate_valid(existing_mode, mode)) {
+                TREELOCK_LOG_WARN("CORE",
+                    "escalate not allowed: node=%llu %s→%s client=%s",
+                    (unsigned long long)node_id,
+                    treelock_mode_name(existing_mode),
+                    treelock_mode_name(mode),
+                    tl->config.client_id);
                 return TREELOCK_ERR_PROTOCOL;
             }
         }
@@ -265,6 +298,9 @@ static RET_CODE _do_lock_core(
     pthread_mutex_unlock(&tl->table_mutex);
 
     if (node == NULL) {
+        TREELOCK_LOG_ERROR("CORE",
+            "failed to get or create lock table node for node_id=%llu",
+            (unsigned long long)node_id);
         return TREELOCK_ERR_INVAL;
     }
 
@@ -281,9 +317,19 @@ static RET_CODE _do_lock_core(
         /* 存在冲突 → 加入等待队列 */
         treelock_wait_entry_t *entry;
 
+        TREELOCK_LOG_DEBUG("CORE",
+            "lock conflict: node=%llu mode=%s client=%s, joining wait queue "
+            "(grant_count=%llu wait_count=%llu)",
+            (unsigned long long)node_id, treelock_mode_name(mode), cid,
+            (unsigned long long)node->grant_count,
+            (unsigned long long)node->wait_count);
+
         rc = treelock_table_add_waiter(node, cid, mode);
         if (rc != TREELOCK_OK) {
             pthread_mutex_unlock(&node->mutex);
+            TREELOCK_LOG_ERROR("CORE",
+                "failed to add waiter: node=%llu mode=%s client=%s",
+                (unsigned long long)node_id, treelock_mode_name(mode), cid);
             return rc;
         }
 
@@ -305,19 +351,34 @@ static RET_CODE _do_lock_core(
                 for (j = 0; j < node->wait_count; j++) {
                     if (&node->wait_queue[j] == entry) {
                         pthread_cond_destroy(&entry->cond);
+                        /* swap-remove：逐字段拷贝，避免 pthread_cond_t 整体赋值 */
                         if (j < node->wait_count - 1) {
-                            node->wait_queue[j] =
-                                node->wait_queue[node->wait_count - 1];
+                            memcpy(node->wait_queue[j].client_id,
+                                   node->wait_queue[node->wait_count - 1].client_id,
+                                   TREELOCK_CLIENT_ID_MAX);
+                            node->wait_queue[j].requested_mode =
+                                node->wait_queue[node->wait_count - 1].requested_mode;
+                            node->wait_queue[j].enqueue_time =
+                                node->wait_queue[node->wait_count - 1].enqueue_time;
+                            /* cond 不拷贝：保留位置 j 原有的 cond 供后续使用 */
                         }
                         node->wait_count--;
                         break;
                     }
                 }
                 pthread_mutex_unlock(&node->mutex);
+                TREELOCK_LOG_WARN("CORE",
+                    "lock timeout: node=%llu mode=%s client=%s timeout=%dms",
+                    (unsigned long long)node_id,
+                    treelock_mode_name(mode), cid, timeout_ms);
                 return TREELOCK_ERR_TIMEOUT;
             }
         } else {
             /* ── 阻塞等待 ── */
+            TREELOCK_LOG_TRACE("CORE",
+                "blocking wait: node=%llu mode=%s client=%s",
+                (unsigned long long)node_id,
+                treelock_mode_name(mode), cid);
             while (TRUE) {
                 INT_32 wait_rc = pthread_cond_wait(&entry->cond, &node->mutex);
                 if (wait_rc == 0) {
@@ -340,15 +401,31 @@ static RET_CODE _do_lock_core(
             }
             if (!granted) {
                 pthread_mutex_unlock(&node->mutex);
+                TREELOCK_LOG_WARN("CORE",
+                    "lock stale after wake: node=%llu mode=%s client=%s",
+                    (unsigned long long)node_id,
+                    treelock_mode_name(mode), cid);
                 return TREELOCK_ERR_STALE;
             }
+            TREELOCK_LOG_TRACE("CORE",
+                "woken and granted: node=%llu mode=%s client=%s",
+                (unsigned long long)node_id,
+                treelock_mode_name(mode), cid);
         }
     } else {
         /* 无冲突 → 直接授予 */
+        TREELOCK_LOG_TRACE("CORE",
+            "direct grant: node=%llu mode=%s client=%s",
+            (unsigned long long)node_id,
+            treelock_mode_name(mode), cid);
         rc = treelock_table_grant_lock(node, cid, mode,
                                         TREELOCK_DEFAULT_LEASE_MS);
         if (rc != TREELOCK_OK) {
             pthread_mutex_unlock(&node->mutex);
+            TREELOCK_LOG_ERROR("CORE",
+                "grant lock failed: node=%llu mode=%s client=%s",
+                (unsigned long long)node_id,
+                treelock_mode_name(mode), cid);
             return rc;
         }
     }
@@ -413,10 +490,12 @@ treelock_t *treelock_create(
 
     /* 初始化互斥锁 */
     if (pthread_mutex_init(&tl->table_mutex, NULL) != 0) {
+        TREELOCK_LOG_ERROR("CORE", "failed to init table_mutex");
         free(tl);
         return NULL;
     }
     if (pthread_mutex_init(&tl->held_mutex, NULL) != 0) {
+        TREELOCK_LOG_ERROR("CORE", "failed to init held_mutex");
         pthread_mutex_destroy(&tl->table_mutex);
         free(tl);
         return NULL;
@@ -477,8 +556,8 @@ VOID treelock_destroy(
         free(node->grants);
         node->grants = NULL;
 
-        /* 销毁等待队列中的条件变量 */
-        for (i = 0; i < node->wait_count; i++) {
+        /* 销毁等待队列中的所有条件变量（含 swap-remove 残留的） */
+        for (i = 0; i < node->wait_capacity; i++) {
             pthread_cond_destroy(&node->wait_queue[i].cond);
         }
         free(node->wait_queue);
@@ -624,6 +703,9 @@ RET_CODE treelock_unlock(
     pthread_mutex_unlock(&tl->table_mutex);
 
     if (node == NULL) {
+        TREELOCK_LOG_WARN("CORE",
+            "unlock stale: node=%llu not in lock table (held by client '%s')",
+            (unsigned long long)node_id, cid);
         _remove_held_lock(tl, node_id);
         return TREELOCK_ERR_STALE;
     }
@@ -641,6 +723,11 @@ RET_CODE treelock_unlock(
         TREELOCK_LOG_DEBUG("CORE", "lock released: node=%llu mode=%s client=%s",
                            (unsigned long long)node_id,
                            treelock_mode_name(held_mode), cid);
+    } else {
+        TREELOCK_LOG_WARN("CORE",
+            "unlock release failed: node=%llu mode=%s client=%s rc=%d",
+            (unsigned long long)node_id,
+            treelock_mode_name(held_mode), cid, rc);
     }
 
     return rc;
@@ -663,12 +750,16 @@ RET_CODE treelock_unlock_all(
     IN treelock_t *tl)
 {
     CSTR_PTR cid;
+    UINT_64 released = 0;
 
     if (tl == NULL || tl->destroyed) {
         return TREELOCK_ERR_INVAL;
     }
 
     cid = (tl->config.client_id != NULL) ? tl->config.client_id : "local";
+
+    TREELOCK_LOG_INFO("CORE", "unlock_all: client='%s' releasing %llu locks",
+                      cid, (unsigned long long)tl->held_count);
 
     pthread_mutex_lock(&tl->held_mutex);
 
@@ -694,12 +785,16 @@ RET_CODE treelock_unlock_all(
             treelock_table_release_lock(node, cid, mode);
             treelock_table_wake_waiters(node);
             pthread_mutex_unlock(&node->mutex);
+            released++;
         }
 
         pthread_mutex_lock(&tl->held_mutex);
     }
 
     pthread_mutex_unlock(&tl->held_mutex);
+
+    TREELOCK_LOG_INFO("CORE", "unlock_all: client='%s' released %llu locks",
+                      cid, (unsigned long long)released);
     return TREELOCK_OK;
 }
 
@@ -954,7 +1049,7 @@ RET_CODE treelock_query_node(
     INT_32           offset;
     UINT_64          i;
 
-    if (tl == NULL || json_result == NULL) {
+    if (tl == NULL || json_result == NULL || tl->destroyed) {
         return TREELOCK_ERR_INVAL;
     }
 
@@ -970,23 +1065,30 @@ RET_CODE treelock_query_node(
     pthread_mutex_lock(&node->mutex);
 
     offset = 0;
-    offset += snprintf(buf + offset, sizeof(buf) - (UINT_64)offset,
+    offset += snprintf(buf + offset, sizeof(buf) - (size_t)offset,
                        "{\"node_id\":%llu,\"grants\":[",
                        (unsigned long long)node->node_id);
 
     for (i = 0; i < node->grant_count; i++) {
-        if (i > 0) {
-            offset += snprintf(buf + offset, sizeof(buf) - (UINT_64)offset, ",");
+        /* 防止缓冲区溢出：剩余空间不足时提前截断 */
+        if ((size_t)offset >= sizeof(buf) - 2) {
+            break;
         }
-        offset += snprintf(buf + offset, sizeof(buf) - (UINT_64)offset,
+        if (i > 0) {
+            offset += snprintf(buf + offset, sizeof(buf) - (size_t)offset, ",");
+        }
+        offset += snprintf(buf + offset, sizeof(buf) - (size_t)offset,
                           "{\"client\":\"%s\",\"mode\":\"%s\"}",
                           node->grants[i].client_id,
                           treelock_mode_name(node->grants[i].mode));
     }
 
-    offset += snprintf(buf + offset, sizeof(buf) - (UINT_64)offset,
-                       "],\"wait_queue_len\":%zu}",
-                       (size_t)node->wait_count);
+    /* 确保 offset 不越界再追加尾部 */
+    if ((size_t)offset < sizeof(buf) - 1) {
+        offset += snprintf(buf + offset, sizeof(buf) - (size_t)offset,
+                           "],\"wait_queue_len\":%zu}",
+                           (size_t)node->wait_count);
+    }
 
     pthread_mutex_unlock(&node->mutex);
 
