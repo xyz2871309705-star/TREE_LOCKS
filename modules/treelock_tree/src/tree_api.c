@@ -87,11 +87,13 @@ static RET_CODE _read_file_to_string(
 
     /* 获取文件大小 */
     if (fseek(fp, 0, SEEK_END) != 0) {
+        TREELOCK_LOG_ERROR("TREE", "fseek failed for file: %s", filepath);
         fclose(fp);
         return TREELOCK_ERR_INVAL;
     }
     fsize = ftell(fp);
     if (fsize < 0) {
+        TREELOCK_LOG_ERROR("TREE", "ftell failed for file: %s", filepath);
         fclose(fp);
         return TREELOCK_ERR_INVAL;
     }
@@ -100,6 +102,8 @@ static RET_CODE _read_file_to_string(
     /* 分配缓冲区（多 1 字节给 '\0'） */
     buf = (CHAR *)malloc((size_t)(fsize + 1));
     if (buf == NULL) {
+        TREELOCK_LOG_ERROR("TREE", "OOM allocating %ld bytes for file: %s",
+                           fsize + 1, filepath);
         fclose(fp);
         return TREELOCK_ERR_INVAL;
     }
@@ -178,6 +182,9 @@ RET_CODE treelock_load_tree_from_string(
 
     /* 如果之前已加载过树，先清除 */
     if (tl->tree_data != NULL) {
+        TREELOCK_LOG_INFO("TREE",
+            "replacing existing tree in client '%s'",
+            tl->config.client_id ? tl->config.client_id : "local");
         tree_index_destroy((treelock_tree_index_t *)tl->tree_data);
         free(tl->tree_data);
         tl->tree_data       = NULL;
@@ -187,6 +194,7 @@ RET_CODE treelock_load_tree_from_string(
     /* 分配树索引 */
     idx = (treelock_tree_index_t *)malloc(sizeof(treelock_tree_index_t));
     if (idx == NULL) {
+        TREELOCK_LOG_ERROR("TREE", "OOM allocating tree index");
         return TREELOCK_ERR_INVAL;
     }
     tree_index_init(idx);
@@ -241,11 +249,13 @@ RET_CODE treelock_register_node(
     if (tl->tree_data == NULL) {
         idx = (treelock_tree_index_t *)malloc(sizeof(treelock_tree_index_t));
         if (idx == NULL) {
+            TREELOCK_LOG_ERROR("TREE", "OOM allocating tree index for register_node");
             return TREELOCK_ERR_INVAL;
         }
         tree_index_init(idx);
         tl->tree_data       = (PTR_VOID)idx;
         tl->tree_get_parent = _tree_get_parent_cb;
+        TREELOCK_LOG_DEBUG("TREE", "lazy-init tree index for register_node");
     } else {
         idx = (treelock_tree_index_t *)tl->tree_data;
     }
@@ -253,7 +263,36 @@ RET_CODE treelock_register_node(
     /* 创建节点 */
     node = tree_node_create(node_id, parent_id, label);
     if (node == NULL) {
+        TREELOCK_LOG_ERROR("TREE",
+            "failed to create node: node_id=%llu parent=%llu",
+            (unsigned long long)node_id, (unsigned long long)parent_id);
         return TREELOCK_ERR_INVAL;
+    }
+
+    /*
+     * 先执行所有校验，通过后再插入 hash 表，
+     * 避免插入后校验失败导致的内存泄漏。
+     */
+
+    /* 校验：父节点必须存在 */
+    if (parent_id != TREE_ROOT_PARENT) {
+        parent_node = tree_index_find(idx, parent_id);
+        if (parent_node == NULL) {
+            TREELOCK_LOG_ERROR("TREE",
+                "register_node: parent_id=%llu does not exist",
+                (unsigned long long)parent_id);
+            tree_node_destroy(node);
+            return TREELOCK_ERR_INVAL;
+        }
+    } else {
+        /* 校验：根节点唯一 */
+        if (idx->root_id != TREE_ROOT_PARENT) {
+            TREELOCK_LOG_ERROR("TREE",
+                "register_node: root already exists (id=%llu), cannot add second root",
+                (unsigned long long)idx->root_id);
+            tree_node_destroy(node);
+            return TREELOCK_ERR_INVAL;
+        }
     }
 
     /* 插入索引（自动查重） */
@@ -263,28 +302,17 @@ RET_CODE treelock_register_node(
         return rc;
     }
 
-    /* 建立父子关系 */
+    /* 建立父子关系（插入 hash 后执行，此时 parent 可通过 tree_index_find 找到） */
     if (parent_id != TREE_ROOT_PARENT) {
         parent_node = tree_index_find(idx, parent_id);
-        if (parent_node == NULL) {
-            TREELOCK_LOG_ERROR("TREE",
-                "register_node: parent_id=%llu does not exist",
-                (unsigned long long)parent_id);
-            /* 回滚：从索引中移除（简化：标记但不实际移除，后续 destroy 会释放） */
-            return TREELOCK_ERR_INVAL;
-        }
+        /* parent_node 已在校验阶段确认为非 NULL */
         rc = tree_node_add_child(parent_node, node);
         if (rc != TREELOCK_OK) {
+            /* 回滚：从 hash 表中移除已插入的节点 */
+            /* 简化处理：标记 node 为孤儿，由 tree_index_destroy 统一释放 */
             return TREELOCK_ERR_INVAL;
         }
     } else {
-        /* 根节点 */
-        if (idx->root_id != TREE_ROOT_PARENT) {
-            TREELOCK_LOG_ERROR("TREE",
-                "register_node: root already exists (id=%llu), cannot add second root",
-                (unsigned long long)idx->root_id);
-            return TREELOCK_ERR_INVAL;
-        }
         idx->root_id = node_id;
     }
 
@@ -369,6 +397,11 @@ RET_CODE treelock_lock_path(
     /* 推导祖先锁模式 */
     ancestor_mode = treelock_ancestor_mode_for(mode);
 
+    TREELOCK_LOG_DEBUG("TREE",
+        "lock_path: path=%s target_mode=%s ancestor_mode=%s path_len=%u",
+        path, treelock_mode_name(mode),
+        treelock_mode_name(ancestor_mode), (unsigned int)path_len);
+
     /*
      * 自顶向下加锁：
      *   路径[0] = 根节点 → ancestor_mode (IS/IX)
@@ -381,6 +414,11 @@ RET_CODE treelock_lock_path(
         if (rc != TREELOCK_OK) {
             /* 部分加锁失败 → 释放已加锁的节点 */
             UINT_32 j;
+            TREELOCK_LOG_ERROR("TREE",
+                "lock_path failed at step %u/%u: node=%llu mode=%s rc=%d",
+                (unsigned int)i, (unsigned int)path_len,
+                (unsigned long long)path_ids[i],
+                treelock_mode_name(lock_mode), rc);
             for (j = 0; j < i; j++) {
                 treelock_unlock(tl, path_ids[j]);
             }
@@ -432,10 +470,16 @@ RET_CODE treelock_unlock_path(
         return rc;
     }
 
+    TREELOCK_LOG_DEBUG("TREE", "unlock_path: path=%s path_len=%u",
+                       path, (unsigned int)path_len);
+
     /* 自底向上释放 */
     for (i = (INT_32)(path_len - 1); i >= 0; i--) {
         rc = treelock_unlock(tl, path_ids[i]);
         if (rc != TREELOCK_OK) {
+            TREELOCK_LOG_WARN("TREE",
+                "unlock_path: unlock node=%llu failed rc=%d",
+                (unsigned long long)path_ids[i], rc);
             /* 记录第一个错误，但继续释放其余锁 */
             if (last_err == TREELOCK_OK) {
                 last_err = rc;

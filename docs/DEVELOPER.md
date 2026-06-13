@@ -153,13 +153,20 @@ TREE_LOCKS/
 │
 ├── tests/                        # 测试
 │   ├── CMakeLists.txt
-│   ├── test_protocol.c               # 协议正确性测试 (12 个用例)
-│   └── test_concurrent.c             # 并发压力测试 (3 个场景)
+│   ├── test_protocol.cc              # 协议正确性测试 (12 GTest 用例)
+│   ├── test_log.cc                   # 日志模块测试 (12 GTest 用例)
+│   ├── test_concurrent.cc            # 并发压力测试 (3 GTest 用例)
+│   └── test_tree.cc                  # 树结构管理测试 (9 GTest 用例)
 │
 └── examples/                     # 示例
     ├── CMakeLists.txt
-    ├── basic_usage.c                 # 4 个基础使用示例
-    └── log_callback_demo.c           # 日志回调注册示例
+    ├── src/
+    │   ├── basic_usage.c                 # 4 个基础使用示例
+    │   ├── log_callback_demo.c           # 日志回调注册示例
+    │   └── tree_usage.c                  # 树结构管理示例 (4 场景)
+    └── json/
+        ├── filesystem_tree.json          # 嵌套格式 JSON 树定义
+        └── filesystem_tree_flat.json     # 扁平格式 JSON 树定义
 ```
 
 ### 3.2 模块依赖关系
@@ -483,33 +490,55 @@ VOID         treelock_platform_local_time(...);     // 本地时间格式化
 
 | 文件 | 用例数 | 说明 |
 |------|--------|------|
-| `tests/test_protocol.c` | 12 | 兼容矩阵、模式转换、升级/降级路径 |
-| `tests/test_concurrent.c` | 3 | 多客户端并发、共享实例一致性、锁升级竞态 |
-| `tests/test_tree.c` | 51 | JSON 解析、树校验、协议自动执行、路径加锁、向后兼容 |
+| `tests/test_protocol.cc` | 12 | 兼容矩阵、模式转换、升级/降级路径 |
+| `tests/test_log.cc` | 12 | 文件输出、日志等级过滤、文件切换、回调共存 |
+| `tests/test_concurrent.cc` | 3 | 多客户端并发、共享实例一致性、锁升级竞态 |
+| `tests/test_tree.cc` | 9 | JSON 解析、树校验、协议自动执行、路径加锁、向后兼容 |
 
-### 7.2 运行测试
+### 7.2 测试框架
+
+使用 **Google Test v1.15.2** 框架。GTest 通过 `_deps/googletest/` 本地副本提供（由 `gh repo clone` 获取），CMake `FetchContent` 集成。
+
+```cmake
+# tests/CMakeLists.txt
+include(FetchContent)
+FetchContent_Declare(googletest SOURCE_DIR "${CMAKE_SOURCE_DIR}/_deps/googletest")
+FetchContent_MakeAvailable(googletest)
+```
+
+测试文件为 C++ (`.cc`)，被测 C 代码通过 `extern "C"` 调用。
+
+### 7.3 运行测试
 
 ```bash
 # 构建并运行
 cmake -B build && cmake --build build
 cd build && ctest --output-on-failure
 
-# 或单独运行
+# 或单独运行（GTest 原生输出）
 ./tests/test_protocol
-./tests/test_concurrent
+./tests/test_tree
+
+# 运行特定测试用例
+./tests/test_protocol --gtest_filter='CompatMatrix.*'
 ```
 
-### 7.3 编写新测试
+### 7.4 编写新测试
 
-测试文件放在 `tests/` 目录，使用项目内置的轻量测试框架：
+测试文件放在 `tests/` 目录，使用 GTest 框架：
 
-```c
-test_begin("测试描述");
-// ... 测试逻辑 ...
-if (condition) {
-    test_pass("额外信息 (可选)");
-} else {
-    test_fail("失败原因");
+```cpp
+#include <gtest/gtest.h>
+
+extern "C" {
+#include "treelock.h"
+}
+
+TEST(MySuite, MyTest) {
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_X), TREELOCK_OK);
+    treelock_destroy(tl);
 }
 ```
 

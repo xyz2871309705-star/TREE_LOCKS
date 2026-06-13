@@ -51,6 +51,8 @@ treelock_tree_node_t *tree_node_create(
     if (label != NULL) {
         node->label = strdup(label);
         if (node->label == NULL) {
+            TREELOCK_LOG_ERROR("TREE",
+                "tree_node_create: strdup failed for label='%s'", label);
             free(node);
             return NULL;
         }
@@ -121,6 +123,12 @@ RET_CODE tree_node_add_child(
             parent->children,
             (size_t)(new_cap * sizeof(treelock_tree_node_t *)));
         if (new_children == NULL) {
+            TREELOCK_LOG_ERROR("TREE",
+                "tree_node_add_child: OOM expanding children for node_id=%llu "
+                "cap=%u→%u",
+                (unsigned long long)parent->node_id,
+                (unsigned int)parent->child_cap,
+                (unsigned int)new_cap);
             return TREELOCK_ERR_INVAL;
         }
         parent->children = new_children;

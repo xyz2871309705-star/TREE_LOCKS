@@ -169,6 +169,11 @@ VOID _log_default_callback(
 
     UNUSED_PARAM(user_data);
 
+    /* 防御性边界检查：level 用于数组索引 */
+    if (level >= TREELOCK_LOG_LEVEL_COUNT) {
+        return;
+    }
+
     _log_format_timestamp(time_buf, sizeof(time_buf));
     short_file = _log_short_file(file);
 
@@ -220,6 +225,11 @@ static VOID _log_write_to_file(
         return;
     }
 
+    /* 防御性边界检查：level 用于数组索引 */
+    if (level >= TREELOCK_LOG_LEVEL_COUNT) {
+        return;
+    }
+
     _log_format_timestamp(time_buf, sizeof(time_buf));
     short_file = _log_short_file(file);
     fp = g_log_ctx.log_file;
@@ -254,7 +264,9 @@ VOID treelock_log_set_level(
     if (level > TREELOCK_LOG_TRACE) {
         level = TREELOCK_LOG_TRACE;
     }
+    pthread_mutex_lock(&g_log_ctx.mutex);
     g_log_ctx.runtime_level = level;
+    pthread_mutex_unlock(&g_log_ctx.mutex);
 }
 
 /**
@@ -266,7 +278,11 @@ VOID treelock_log_set_level(
  */
 treelock_log_level_t treelock_log_get_level(VOID)
 {
-    return g_log_ctx.runtime_level;
+    treelock_log_level_t level;
+    pthread_mutex_lock(&g_log_ctx.mutex);
+    level = g_log_ctx.runtime_level;
+    pthread_mutex_unlock(&g_log_ctx.mutex);
+    return level;
 }
 
 /**
@@ -284,8 +300,10 @@ VOID treelock_log_set_callback(
     IN treelock_log_callback_t  cb,
     IN PTR_VOID                 user_data)
 {
+    pthread_mutex_lock(&g_log_ctx.mutex);
     g_log_ctx.callback      = cb;
     g_log_ctx.callback_data = user_data;
+    pthread_mutex_unlock(&g_log_ctx.mutex);
 }
 
 /**
@@ -297,7 +315,11 @@ VOID treelock_log_set_callback(
  */
 treelock_log_callback_t treelock_log_get_callback(VOID)
 {
-    return g_log_ctx.callback;
+    treelock_log_callback_t cb;
+    pthread_mutex_lock(&g_log_ctx.mutex);
+    cb = g_log_ctx.callback;
+    pthread_mutex_unlock(&g_log_ctx.mutex);
+    return cb;
 }
 
 /**
@@ -312,7 +334,7 @@ treelock_log_callback_t treelock_log_get_callback(VOID)
 CSTR_PTR treelock_log_level_name(
     IN treelock_log_level_t level)
 {
-    if (level >= TREELOCK_LOG_LEVEL_COUNT) {
+    if (level < TREELOCK_LOG_OFF || level >= TREELOCK_LOG_LEVEL_COUNT) {
         return "UNKNOWN";
     }
     return g_level_names[level];

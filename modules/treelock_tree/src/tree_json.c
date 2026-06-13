@@ -121,6 +121,10 @@ static RET_CODE parse_ctx_add_node(
         new_nodes = (parsed_node_t *)realloc(
             ctx->nodes, (size_t)(new_cap * sizeof(parsed_node_t)));
         if (new_nodes == NULL) {
+            TREELOCK_LOG_ERROR("TREE",
+                "parse_ctx: OOM expanding from %llu to %llu nodes",
+                (unsigned long long)ctx->capacity,
+                (unsigned long long)new_cap);
             ctx->error = TRUE;
             return TREELOCK_ERR_INVAL;
         }
@@ -394,9 +398,13 @@ static RET_CODE _parse_tree_json(
      * 将 parse_ctx 转换为 treelock_tree_node_t 数组。
      * 不在 parse_ctx 中直接创建 tree_node 是因为校验步骤需要先检查所有节点。
      */
+    /* 转换：为 parse_ctx 中每个节点创建 treelock_tree_node_t */
     result_nodes = (treelock_tree_node_t **)malloc(
         (size_t)(ctx.count * sizeof(treelock_tree_node_t *)));
     if (result_nodes == NULL) {
+        TREELOCK_LOG_ERROR("TREE",
+            "OOM allocating result array for %llu nodes",
+            (unsigned long long)ctx.count);
         parse_ctx_destroy(&ctx);
         return TREELOCK_ERR_INVAL;
     }
@@ -493,12 +501,13 @@ RET_CODE treelock_load_tree_from_string_internal(
         for (i = 0; i < count; i++) {
             rc = tree_index_insert(idx, nodes[i]);
             if (rc != TREELOCK_OK) {
+                /*
+                 * 回滚：nodes[0..i-1] 已在 hash 表中（由 idx 接管），
+                 * 只销毁 nodes[i..count-1]（尚未插入的节点）。
+                 * 已插入的节点由调用者 tree_index_destroy(idx) 统一释放。
+                 */
                 UINT_64 j;
-                /* 回滚已插入的节点 */
-                for (j = 0; j < i; j++) {
-                    /* 从 hash 表移除（简化：标记但不实际移除，因为后续 destroy 会处理） */
-                }
-                for (j = 0; j < count; j++) {
+                for (j = i; j < count; j++) {
                     tree_node_destroy(nodes[j]);
                 }
                 free(nodes);
@@ -513,11 +522,12 @@ RET_CODE treelock_load_tree_from_string_internal(
                 if (parent != NULL) {
                     rc = tree_node_add_child(parent, nodes[i]);
                     if (rc != TREELOCK_OK) {
-                        /* OOM，致命错误 */
-                        UINT_64 j;
-                        for (j = 0; j < count; j++) {
-                            tree_node_destroy(nodes[j]);
-                        }
+                        /*
+                         * OOM 致命错误：节点已在 hash 表中，
+                         * 但子节点关系建立失败。
+                         * 已插入的节点由调用者 tree_index_destroy(idx) 统一释放。
+                         * 只释放 nodes 指针数组（节点本身由 idx 接管）。
+                         */
                         free(nodes);
                         return rc;
                     }
@@ -537,9 +547,10 @@ RET_CODE treelock_load_tree_from_string_internal(
 
     idx->loaded = TRUE;
 
-    TREELOCK_LOG_INFO("TREE", "tree loaded: %llu nodes, root=%llu",
-                      (unsigned long long)idx->node_count,
-                      (unsigned long long)idx->root_id);
+    TREELOCK_LOG_INFO("TREE",
+        "tree structure fully loaded: %llu nodes, root_id=%llu",
+        (unsigned long long)idx->node_count,
+        (unsigned long long)idx->root_id);
 
     /* 释放临时节点指针数组（节点本身已由索引接管） */
     free(nodes);

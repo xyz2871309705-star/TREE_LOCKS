@@ -90,7 +90,9 @@ TREE_LOCKS/
 ├── docs/                           # 文档
 │   ├── 设计.md                     # 设计文档
 │   ├── DEVELOPER.md                # 开发者文档 (详细)
-│   └── ROADMAP.md                  # 迭代计划
+│   ├── ROADMAP.md                  # 迭代计划
+│   ├── 树结构管理方案.md            # 树结构方案说明书
+│   └── tree-json-format.md         # JSON 树定义格式规格
 │
 ├── modules/                        # ★ 模块 (独立 include/ + src/)
 │   ├── treelock_log/               # 模块 0: 统一日志 [基础依赖]
@@ -137,9 +139,13 @@ TREE_LOCKS/
 │   └── test_tree.c                 # 树结构管理 (51 用例)
 │
 └── examples/
-    ├── basic_usage.c               # 基础使用 (4 示例)
-    ├── log_callback_demo.c         # 日志回调注册
-    └── tree_usage.c                # 树结构管理 (3 示例)
+    ├── src/
+    │   ├── basic_usage.c               # 基础使用 (4 示例)
+    │   ├── log_callback_demo.c         # 日志回调注册
+    │   └── tree_usage.c                # 树结构管理 (4 示例)
+    └── json/
+        ├── filesystem_tree.json        # 嵌套格式 JSON 树定义 (9 节点)
+        └── filesystem_tree_flat.json   # 扁平格式 JSON 树定义 (9 节点)
 ```
 
 ---
@@ -301,33 +307,22 @@ treelock_log_set_level(TREELOCK_LOG_WARN);  // 运行期过滤
 
 ## 测试
 
-| 测试 | 用例数 | 命令 |
-|------|--------|------|
-| 协议正确性 | 12 | `./build/tests/test_protocol` |
-| 并发压力 | 3 | `./build/tests/test_concurrent` |
-| 树结构管理 | 51 | `./build/tests/test_tree` |
+| 测试 | 用例数 | 框架 | 命令 |
+|------|--------|------|------|
+| 协议正确性 | 12 | Google Test | `./build/tests/test_protocol` |
+| 日志模块 | 12 | Google Test | `./build/tests/test_log` |
+| 并发压力 | 3 | Google Test | `./build/tests/test_concurrent` |
+| 树结构管理 | 9 | Google Test | `./build/tests/test_tree` |
+
+> **测试框架**: Google Test v1.15.2 (C++)，通过 `_deps/googletest/` 本地副本提供，CMake `FetchContent` 集成。
 
 ```
+$ ctest --output-on-failure
+100% tests passed, 0 tests failed out of 4
+
 $ ./tests/test_protocol
-兼容矩阵测试:
-  TEST: NL compatible with all modes ... PASSED
-  TEST: X compatible only with NL ... PASSED
-  ...
-结果: 12/12 通过, 0 失败
-
-$ ./tests/test_concurrent
-  TEST: concurrent multi-client lock/unlock ... PASSED (8000 ops)
-  TEST: concurrent consistency (shared instance) ... PASSED
-  TEST: concurrent lock escalate ... PASSED
-结果: 3/3 通过, 0 失败
-
-$ ./tests/test_tree
---- Test 1: manual register_node ---
-  PASS: create client
-  ...
---- Test 9: backward compatibility (no tree) ---
-  PASS: lock without tree works (backward compat)
-结果: 51/51 通过, 0 失败
+[==========] 12 tests from 5 test suites ran. (0 ms total)
+[  PASSED  ] 12 tests.
 ```
 
 ---
@@ -339,6 +334,8 @@ $ ./tests/test_tree
 | [设计.md](docs/设计.md) | 完整设计思路、协议推导、架构总览 |
 | [DEVELOPER.md](docs/DEVELOPER.md) | 开发者文档：上手、架构、编码规范、模块详解、FAQ |
 | [ROADMAP.md](docs/ROADMAP.md) | 迭代计划：14 个迭代、预估工时、优先级、验收标准 |
+| [树结构管理方案.md](docs/树结构管理方案.md) | 树结构方案说明书：可行性分析、设计决策、实现记录 |
+| [tree-json-format.md](docs/tree-json-format.md) | JSON 格式规格：字段定义、两种格式、校验规则、完整示例 |
 
 ---
 
