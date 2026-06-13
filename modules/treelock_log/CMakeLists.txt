@@ -1,33 +1,30 @@
 # ============================================================================
-# 模块: treelock_core — 核心锁协议与客户端 API
+# 模块: treelock_log — 日志模块
 #
 # 职责:
-#   - 多粒度意向锁兼容矩阵
-#   - 锁模式转换与升级/降级路径验证
-#   - 内存锁表管理（授权列表、等待队列）
-#   - 线程安全客户端 API
+#   - 6 级日志等级（FATAL/ERROR/WARN/INFO/DEBUG/TRACE）
+#   - 编译期 + 运行期双重输出控制
+#   - 外部回调注册（自定义日志输出）
+#   - 线程安全 + 递归保护
 #
-# 产出: libtreelock_core.a (静态库)
-# 依赖: pthread (系统库), treelock_types.h (本模块)
+# 产出: libtreelock_log.a (静态库)
+# 依赖: treelock_types.h（类型封装宏）, pthread（线程安全）
 # ============================================================================
 
-set(MODULE_NAME treelock_core)
+set(MODULE_NAME treelock_log)
 
 # ── 源文件 ──
 set(MODULE_SOURCES
-    src/protocol.c
-    src/lock_table.c
-    src/client.c
+    src/log_core.c
 )
 
 # ── 头文件 ──
 set(MODULE_PUBLIC_HEADERS
-    include/treelock.h
-    include/treelock_types.h
+    include/treelock_log.h
 )
 
 set(MODULE_PRIVATE_HEADERS
-    src/internal.h
+    src/log_internal.h
 )
 
 # ── 构建静态库 ──
@@ -41,6 +38,7 @@ add_library(${MODULE_NAME} STATIC
 target_include_directories(${MODULE_NAME}
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/modules/treelock_core/include  # treelock_types.h
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
@@ -48,8 +46,13 @@ target_include_directories(${MODULE_NAME}
 # ── 链接依赖 ──
 target_link_libraries(${MODULE_NAME}
     PUBLIC
-        treelock_log
         pthread
+)
+
+# ── 编译定义：Release 构建裁掉 DEBUG/TRACE ──
+target_compile_definitions(${MODULE_NAME}
+    PRIVATE
+        $<$<CONFIG:Release>:NDEBUG>
 )
 
 # ── 安装规则 ──

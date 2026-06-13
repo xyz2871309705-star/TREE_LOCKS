@@ -60,6 +60,14 @@ TreeLocks/
 │   └── 设计.md                 # 设计文档
 │
 ├── modules/                    # ★ 模块目录（每个模块独立 include/ + src/）
+│   ├── treelock_log/           # 模块 0：日志模块 [基础依赖]
+│   │   ├── CMakeLists.txt
+│   │   ├── include/
+│   │   │   └── treelock_log.h      # 日志 API（6 级等级 + 回调注册）
+│   │   └── src/
+│   │       ├── log_internal.h      # 日志内部结构
+│   │       └── log_core.c          # 日志核心实现
+│   │
 │   ├── treelock_core/          # 模块 1：核心锁协议与客户端 API [阶段一]
 │   │   ├── CMakeLists.txt
 │   │   ├── include/

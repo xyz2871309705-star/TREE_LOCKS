@@ -9,6 +9,7 @@
  */
 
 #include "internal.h"
+#include "treelock_log.h"
 #include <stdlib.h> /* malloc, free, realloc */
 #include <string.h> /* strncpy */
 #include <time.h>   /* time */
@@ -217,6 +218,10 @@ RET_CODE treelock_table_grant_lock(
     }
 
     node->grant_count++;
+
+    TREELOCK_LOG_TRACE("TABLE", "grant: node=%llu mode=%s client=%s",
+                       (unsigned long long)node->node_id,
+                       treelock_mode_name(mode), client_id);
     return TREELOCK_OK;
 }
 

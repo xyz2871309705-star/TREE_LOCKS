@@ -35,6 +35,9 @@ file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/include)
 # 子模块
 # ============================================================================
 
+# 模块 0: 日志模块（所有模块的基础依赖）
+add_subdirectory(modules/treelock_log)
+
 # 模块 1: 核心锁协议与客户端 API（阶段一）
 add_subdirectory(modules/treelock_core)
 

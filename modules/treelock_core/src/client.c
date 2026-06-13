@@ -8,6 +8,7 @@
  */
 
 #include "internal.h"
+#include "treelock_log.h"
 #include <stdlib.h> /* malloc, free, realloc */
 #include <string.h> /* strncpy */
 #include <time.h>   /* time */
@@ -364,10 +365,16 @@ static RET_CODE _do_lock_core(
             treelock_table_release_lock(node, cid, mode);
             treelock_table_wake_waiters(node);
             pthread_mutex_unlock(&node->mutex);
+            TREELOCK_LOG_ERROR("CORE",
+                "lock node=%llu mode=%s failed: cannot record held lock",
+                (unsigned long long)node_id, treelock_mode_name(mode));
             return rc;
         }
     }
 
+    TREELOCK_LOG_DEBUG("CORE", "lock acquired: node=%llu mode=%s client=%s",
+                       (unsigned long long)node_id,
+                       treelock_mode_name(mode), cid);
     return TREELOCK_OK;
 }
 
@@ -419,6 +426,8 @@ treelock_t *treelock_create(
     tl->connected = TRUE;
     tl->destroyed = FALSE;
 
+    TREELOCK_LOG_INFO("CORE", "client '%s' created",
+                      tl->config.client_id);
     return tl;
 }
 
@@ -446,6 +455,10 @@ VOID treelock_destroy(
     if (tl == NULL) {
         return;
     }
+
+    TREELOCK_LOG_INFO("CORE", "client '%s' destroying, %llu locks held",
+                      tl->config.client_id,
+                      (unsigned long long)tl->held_count);
 
     /* 释放所有持有的锁 */
     treelock_unlock_all(tl);
@@ -597,6 +610,9 @@ RET_CODE treelock_unlock(
 
     if (rc == TREELOCK_OK) {
         _remove_held_lock(tl, node_id);
+        TREELOCK_LOG_DEBUG("CORE", "lock released: node=%llu mode=%s client=%s",
+                           (unsigned long long)node_id,
+                           treelock_mode_name(held_mode), cid);
     }
 
     return rc;
