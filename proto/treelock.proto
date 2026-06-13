@@ -1,0 +1,91 @@
+/*
+ * TreeLocks - 通信协议定义
+ *
+ * 用于阶段三（自研服务版）的客户端↔服务端通信。
+ * 阶段一单机版不使用此文件。
+ */
+
+syntax = "proto3";
+
+package treelock;
+
+/* =========================================================================
+ * 锁请求
+ * ========================================================================= */
+
+message LockRequest {
+    string client_id       = 1;  /* 客户端标识 */
+    uint64 request_id      = 2;  /* 请求 ID（用于匹配响应） */
+    uint64 node_id         = 3;  /* 目标节点 ID */
+    int32  mode            = 4;  /* 锁模式: 0=NL, 1=IS, 2=IX, 3=S, 4=SIX, 5=X */
+    int32  timeout_ms      = 5;  /* 超时时间（0=阻塞等待） */
+}
+
+message LockResponse {
+    uint64 request_id      = 1;  /* 对应请求的 ID */
+    int32  result          = 2;  /* 0=成功, 负值=错误码 */
+    uint64 lease_expire_at = 3;  /* 租约过期时间（Unix 时间戳 ms） */
+}
+
+/* =========================================================================
+ * 锁释放
+ * ========================================================================= */
+
+message UnlockRequest {
+    string client_id       = 1;  /* 客户端标识 */
+    uint64 node_id         = 2;  /* 目标节点 ID */
+}
+
+message UnlockResponse {
+    int32  result          = 1;  /* 0=成功, 负值=错误码 */
+}
+
+/* =========================================================================
+ * 锁升级 / 降级
+ * ========================================================================= */
+
+message EscalateRequest {
+    string client_id       = 1;  /* 客户端标识 */
+    uint64 request_id      = 2;  /* 请求 ID */
+    uint64 node_id         = 3;  /* 目标节点 ID */
+    int32  new_mode        = 4;  /* 目标锁模式 */
+}
+
+message EscalateResponse {
+    uint64 request_id      = 1;
+    int32  result          = 2;
+    uint64 lease_expire_at = 3;
+}
+
+message DowngradeRequest {
+    string client_id       = 1;
+    uint64 node_id         = 2;
+    int32  new_mode        = 3;
+}
+
+message DowngradeResponse {
+    int32  result          = 1;
+}
+
+/* =========================================================================
+ * 心跳 / 租约续约
+ * ========================================================================= */
+
+message Heartbeat {
+    string client_id       = 1;
+    repeated uint64 node_ids = 2; /* 需要续约的节点列表 */
+}
+
+message HeartbeatAck {
+    int32  result          = 1;
+    repeated uint64 expired_node_ids = 2; /* 已过期的节点（客户端应释放） */
+}
+
+/* =========================================================================
+ * 服务端推送
+ * ========================================================================= */
+
+message LockLostNotification {
+    uint64 node_id         = 1;  /* 锁已丢失的节点 */
+    int32  reason          = 2;  /* 原因: 1=租约过期, 2=被抢占 */
+}
