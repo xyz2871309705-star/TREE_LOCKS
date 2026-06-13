@@ -15,3 +15,15 @@ target_link_libraries(log_callback_demo PRIVATE treelock_log treelock_core)
 # ── 示例 3：树结构管理 ──
 add_executable(tree_usage tree_usage.c)
 target_link_libraries(tree_usage PRIVATE treelock_tree)
+
+# 复制 JSON 树定义文件到构建目录（tree_usage 示例需要）
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/filesystem_tree.json"
+    "${CMAKE_CURRENT_BINARY_DIR}/filesystem_tree.json"
+    COPYONLY
+)
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/filesystem_tree_flat.json"
+    "${CMAKE_CURRENT_BINARY_DIR}/filesystem_tree_flat.json"
+    COPYONLY
+)

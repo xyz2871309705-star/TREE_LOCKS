@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "filesystem_locks",
+  "nodes": [
+    { "id": 1,  "label": "/" },
+    { "id": 2,  "label": "home",   "parent": 1 },
+    { "id": 10, "label": "alice",  "parent": 2 },
+    { "id": 11, "label": "bob",    "parent": 2 },
+    { "id": 3,  "label": "var",    "parent": 1 },
+    { "id": 20, "label": "log",    "parent": 3 },
+    { "id": 21, "label": "cache",  "parent": 3 },
+    { "id": 4,  "label": "etc",    "parent": 1 },
+    { "id": 30, "label": "config", "parent": 4 }
+  ]
+}

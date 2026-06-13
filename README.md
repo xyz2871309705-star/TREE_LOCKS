@@ -90,7 +90,9 @@ TREE_LOCKS/
 ├── docs/                           # 文档
 │   ├── 设计.md                     # 设计文档
 │   ├── DEVELOPER.md                # 开发者文档 (详细)
-│   └── ROADMAP.md                  # 迭代计划
+│   ├── ROADMAP.md                  # 迭代计划
+│   ├── 树结构管理方案.md            # 树结构方案说明书
+│   └── tree-json-format.md         # JSON 树定义格式规格
 │
 ├── modules/                        # ★ 模块 (独立 include/ + src/)
 │   ├── treelock_log/               # 模块 0: 统一日志 [基础依赖]
@@ -139,7 +141,9 @@ TREE_LOCKS/
 └── examples/
     ├── basic_usage.c               # 基础使用 (4 示例)
     ├── log_callback_demo.c         # 日志回调注册
-    └── tree_usage.c                # 树结构管理 (3 示例)
+    ├── tree_usage.c                # 树结构管理 (4 示例)
+    ├── filesystem_tree.json        # 嵌套格式 JSON 树定义 (9 节点)
+    └── filesystem_tree_flat.json   # 扁平格式 JSON 树定义 (9 节点)
 ```
 
 ---
@@ -339,6 +343,8 @@ $ ./tests/test_tree
 | [设计.md](docs/设计.md) | 完整设计思路、协议推导、架构总览 |
 | [DEVELOPER.md](docs/DEVELOPER.md) | 开发者文档：上手、架构、编码规范、模块详解、FAQ |
 | [ROADMAP.md](docs/ROADMAP.md) | 迭代计划：14 个迭代、预估工时、优先级、验收标准 |
+| [树结构管理方案.md](docs/树结构管理方案.md) | 树结构方案说明书：可行性分析、设计决策、实现记录 |
+| [tree-json-format.md](docs/tree-json-format.md) | JSON 格式规格：字段定义、两种格式、校验规则、完整示例 |
 
 ---
 

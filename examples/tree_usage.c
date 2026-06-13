@@ -2,13 +2,12 @@
  * TreeLocks — 树结构管理使用示例
  *
  * 演示:
- *   1. 从 JSON 文件加载树结构
- *   2. 从 JSON 字符串加载
- *   3. 编程式手动注册节点
- *   4. 路径加锁 / 解锁
- *   5. 协议自动校验
+ *   1. 从嵌套 JSON 文件加载树 + 路径加锁/解锁
+ *   2. 从扁平 JSON 文件加载树 + 验证与嵌套格式等价
+ *   3. 编程式注册节点 + 协议自动校验
+ *   4. 无树结构 — 向后兼容模式
  *
- * 版本: 0.1.0
+ * 版本: 0.2.0
  * 日期: 2026-06-13
  */
 
@@ -20,76 +19,130 @@
 #include <string.h>
 
 /* =========================================================================
- * 示例 1: 从 JSON 字符串加载 + 路径加锁
+ * 示例 1: 从嵌套 JSON 文件加载 + 路径加锁
+ *
+ * 使用 examples/filesystem_tree.json (嵌套格式)
  * ========================================================================= */
 
-static VOID example_json_path_lock(VOID)
+static VOID example_nested_json_file(VOID)
 {
     treelock_t *tl;
-    CSTR_PTR tree_json =
-        "{"
-        "  \"tree\": {"
-        "    \"id\": 1, \"label\": \"/\","
-        "    \"children\": ["
-        "      {"
-        "        \"id\": 2, \"label\": \"home\","
-        "        \"children\": ["
-        "          { \"id\": 10, \"label\": \"alice\" },"
-        "          { \"id\": 11, \"label\": \"bob\" }"
-        "        ]"
-        "      },"
-        "      {"
-        "        \"id\": 3, \"label\": \"var\","
-        "        \"children\": ["
-        "          { \"id\": 20, \"label\": \"log\" }"
-        "        ]"
-        "      }"
-        "    ]"
-        "  }"
-        "}";
+    CSTR_PTR    tree_file = "filesystem_tree.json";
 
-    printf("\n========== 示例 1: JSON + 路径加锁 ==========\n");
+    printf("\n========== 示例 1: 嵌套 JSON 文件 + 路径加锁 ==========\n");
 
     tl = treelock_create(NULL);
+    if (tl == NULL) {
+        printf("  ERROR: failed to create client\n");
+        return;
+    }
 
-    /* 加载树 */
-    if (treelock_load_tree_from_string(tl, tree_json) != TREELOCK_OK) {
-        printf("  ERROR: failed to load tree\n");
+    /* 从 JSON 文件加载树结构 */
+    if (treelock_load_tree_from_file(tl, tree_file) != TREELOCK_OK) {
+        printf("  ERROR: failed to load '%s'\n", tree_file);
+        printf("  (请在工作目录或 build/ 目录下运行此示例)\n");
         treelock_destroy(tl);
         return;
     }
-    printf("  Tree loaded OK (%s)\n",
-           treelock_tree_loaded(tl) ? "verified" : "ERROR");
+    printf("  Loaded '%s' — %s\n", tree_file,
+           treelock_tree_loaded(tl) ? "OK" : "ERROR");
 
-    /* 路径加锁: 排他访问 /home/alice */
+    /* ── 场景 A: 排他写 /home/alice ── */
+    printf("\n  --- 场景 A: 排他写 /home/alice ---\n");
+
     if (treelock_lock_path(tl, "/home/alice", TREELOCK_X) == TREELOCK_OK) {
-        printf("  Locked /home/alice (X) via path\n");
+        printf("  Locked /home/alice (X) → 路径自动: / (IX) → /home (IX) → /home/alice (X)\n");
 
-        /* 验证锁状态 */
-        printf("    /            → %s\n",
-               treelock_mode_name(treelock_get_mode(tl, 1)));
-        printf("    /home        → %s\n",
-               treelock_mode_name(treelock_get_mode(tl, 2)));
-        printf("    /home/alice  → %s\n",
-               treelock_mode_name(treelock_get_mode(tl, 10)));
-
-        /* 操作完成，释放 */
         treelock_unlock_path(tl, "/home/alice");
-        printf("  Unlocked /home/alice\n");
+        printf("  Released all locks\n");
+    }
+
+    /* ── 场景 B: 共享读 /var/log ── */
+    printf("\n  --- 场景 B: 共享读 /var/log ---\n");
+
+    if (treelock_lock_path(tl, "/var/log", TREELOCK_S) == TREELOCK_OK) {
+        printf("  Locked /var/log (S) → 路径自动: / (IS) → /var (IS) → /var/log (S)\n");
+
+        treelock_unlock_path(tl, "/var/log");
+        printf("  Released all locks\n");
+    }
+
+    /* ── 场景 C: 排他锁整个 /etc 子树 ── */
+    printf("\n  --- 场景 C: 锁定整棵子树 /etc ---\n");
+
+    if (treelock_lock_path(tl, "/etc", TREELOCK_X) == TREELOCK_OK) {
+        printf("  Locked /etc (X) → 整个子树不可并发修改\n");
+        printf("  其他客户端此时无法读写 /etc/config\n");
+
+        treelock_unlock_path(tl, "/etc");
+        printf("  Released /etc\n");
     }
 
     treelock_destroy(tl);
 }
 
 /* =========================================================================
- * 示例 2: 编程式注册 + 协议自动校验
+ * 示例 2: 从扁平 JSON 文件加载 + 验证等价性
+ *
+ * 使用 examples/filesystem_tree_flat.json (扁平格式)
+ * 演示与嵌套格式定义完全相同的树结构。
+ * ========================================================================= */
+
+static VOID example_flat_json_file(VOID)
+{
+    treelock_t *tl;
+    CSTR_PTR    tree_file = "filesystem_tree_flat.json";
+    treelock_node_id_t node_id;
+
+    printf("\n========== 示例 2: 扁平 JSON 文件 + 等价验证 ==========\n");
+
+    tl = treelock_create(NULL);
+    if (tl == NULL) {
+        printf("  ERROR: failed to create client\n");
+        return;
+    }
+
+    /* 从扁平 JSON 文件加载 */
+    if (treelock_load_tree_from_file(tl, tree_file) != TREELOCK_OK) {
+        printf("  ERROR: failed to load '%s'\n", tree_file);
+        printf("  (请在工作目录或 build/ 目录下运行此示例)\n");
+        treelock_destroy(tl);
+        return;
+    }
+    printf("  Loaded '%s' — OK\n", tree_file);
+    printf("  格式: 扁平数组 (9 个节点)\n");
+
+    /* 验证路径查找 — 与嵌套格式结果一致 */
+    treelock_lookup_path(tl, "/home/alice", &node_id);
+    printf("  lookup '/home/alice'  → id=%llu (应为 10)\n",
+           (unsigned long long)node_id);
+
+    treelock_lookup_path(tl, "/var/cache",  &node_id);
+    printf("  lookup '/var/cache'   → id=%llu (应为 21)\n",
+           (unsigned long long)node_id);
+
+    treelock_lookup_path(tl, "/etc/config", &node_id);
+    printf("  lookup '/etc/config'  → id=%llu (应为 30)\n",
+           (unsigned long long)node_id);
+
+    /* 路径加锁同样可用 */
+    treelock_lock_path(tl, "/home/bob", TREELOCK_S);
+    printf("  lock_path '/home/bob' (S) → OK\n");
+
+    treelock_unlock_path(tl, "/home/bob");
+
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * 示例 3: 编程式注册 + 协议自动校验
  * ========================================================================= */
 
 static VOID example_programmatic(VOID)
 {
     treelock_t *tl;
 
-    printf("\n========== 示例 2: 编程式注册 + 协议校验 ==========\n");
+    printf("\n========== 示例 3: 编程式注册 + 协议校验 ==========\n");
 
     tl = treelock_create(NULL);
 
@@ -123,14 +176,14 @@ static VOID example_programmatic(VOID)
 }
 
 /* =========================================================================
- * 示例 3: 无树结构 — 向后兼容
+ * 示例 4: 无树结构 — 向后兼容
  * ========================================================================= */
 
 static VOID example_no_tree_compat(VOID)
 {
     treelock_t *tl;
 
-    printf("\n========== 示例 3: 向后兼容（无树）==========\n");
+    printf("\n========== 示例 4: 向后兼容（无树）==========\n");
 
     tl = treelock_create(NULL);
 
@@ -151,7 +204,8 @@ INT_32 main(VOID)
     printf("TreeLocks — Tree Structure Usage Examples\n");
     printf("==========================================\n");
 
-    example_json_path_lock();
+    example_nested_json_file();
+    example_flat_json_file();
     example_programmatic();
     example_no_tree_compat();
 
