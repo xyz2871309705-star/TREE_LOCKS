@@ -10,9 +10,9 @@
 
 #include "internal.h"
 #include "treelock_log.h"
+#include "treelock_platform.h"
 #include <stdlib.h> /* malloc, free, realloc */
 #include <string.h> /* strncpy */
-#include <time.h>   /* time */
 
 /* =========================================================================
  * 内部辅助函数
@@ -23,13 +23,14 @@
  *
  * 功能描述：获取当前 Unix 时间戳（毫秒精度）
  *
- *          阶段一使用 time()（秒精度×1000），后续可用 clock_gettime 替代。
+ *          委托平台抽象层：Windows → GetSystemTimeAsFileTime,
+ *                         Linux   → gettimeofday
  *
- * @return 当前时间的毫秒时间戳
+ * @return 当前毫秒时间戳
  */
 static TIMESTAMP_MS _current_time_ms(VOID)
 {
-    return (TIMESTAMP_MS)time(NULL) * 1000;
+    return treelock_platform_time_ms();
 }
 
 /**

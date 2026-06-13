@@ -8,6 +8,7 @@
 #define TREELOCK_LOG_INTERNAL_H
 
 #include "treelock_log.h"
+#include "treelock_platform.h"
 #include <pthread.h>
 #include <stdio.h>  /* FILE*, vfprintf (仅默认回调使用) */
 
@@ -87,9 +88,10 @@ VOID _log_default_callback(
  *
  * 功能描述：格式化当前时间戳到缓冲区
  *
- *          格式: "2026-06-13 14:30:00.123"
+ *          委托 treelock_platform_local_time()，
+ *          Windows → GetLocalTime，Linux → gettimeofday + localtime_r
  *
- * @param[OUT] buf     - 输出缓冲区（至少 TREELOCK_LOG_TIME_BUF 字节）
+ * @param[OUT] buf      - 输出缓冲区（至少 TREELOCK_LOG_TIME_BUF 字节）
  * @param[IN]  buf_size - 缓冲区大小
  */
 VOID _log_format_timestamp(

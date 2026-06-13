@@ -9,8 +9,6 @@
 
 #include <stdio.h>   /* vfprintf, stderr, FILE */
 #include <string.h>  /* strlen, strncpy */
-#include <time.h>    /* time, localtime */
-#include <sys/time.h>/* gettimeofday (POSIX) */
 #include <stdlib.h>  /* NULL */
 
 /* =========================================================================
@@ -98,10 +96,9 @@ CSTR_PTR _log_short_file(
 /**
  * 函数名称：_log_format_timestamp
  *
- * 功能描述：格式化当前时间戳
+ * 功能描述：格式化当前时间戳（委托平台抽象层）
  *
  *          格式: "2026-06-13 14:30:00.123"
- *          使用 gettimeofday 获取毫秒精度。
  *
  * @param[OUT] buf      - 输出缓冲区
  * @param[IN]  buf_size - 缓冲区大小（应 >= TREELOCK_LOG_TIME_BUF）
@@ -110,31 +107,7 @@ VOID _log_format_timestamp(
     OUT CHAR   *buf,
     IN  UINT_32 buf_size)
 {
-    struct timeval  tv;
-    struct tm       tm_info;
-    INT_32          written;
-
-    if (buf == NULL || buf_size == 0) {
-        return;
-    }
-
-    gettimeofday(&tv, NULL);
-#ifdef _WIN32
-    /* Windows: localtime_s — time_t 在 MinGW 中是 64 位，需显式转换 */
-    {
-        time_t sec = (time_t)tv.tv_sec;
-        localtime_s(&tm_info, &sec);
-    }
-#else
-    /* POSIX: localtime_r */
-    localtime_r(&tv.tv_sec, &tm_info);
-#endif
-
-    written = (INT_32)strftime(buf, (size_t)buf_size, "%Y-%m-%d %H:%M:%S", &tm_info);
-    if (written > 0 && (UINT_32)written + 5 < buf_size) {
-        snprintf(buf + written, (size_t)(buf_size - (UINT_32)written),
-                 ".%03ld", (long)(tv.tv_usec / 1000));
-    }
+    treelock_platform_local_time(buf, buf_size);
 }
 
 /**

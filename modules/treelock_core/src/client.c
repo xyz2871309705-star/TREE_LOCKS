@@ -9,9 +9,9 @@
 
 #include "internal.h"
 #include "treelock_log.h"
+#include "treelock_platform.h"
 #include <stdlib.h> /* malloc, free, realloc */
 #include <string.h> /* strncpy */
-#include <time.h>   /* time */
 #include <stdio.h>  /* snprintf */
 #include <errno.h>  /* ETIMEDOUT */
 
@@ -28,7 +28,7 @@
  */
 static TIMESTAMP_MS _current_time_ms(VOID)
 {
-    return (TIMESTAMP_MS)time(NULL) * 1000;
+    return treelock_platform_time_ms();
 }
 
 /* =========================================================================

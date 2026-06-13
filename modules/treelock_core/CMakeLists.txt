@@ -1,14 +1,8 @@
 # ============================================================================
 # 模块: treelock_core — 核心锁协议与客户端 API
 #
-# 职责:
-#   - 多粒度意向锁兼容矩阵
-#   - 锁模式转换与升级/降级路径验证
-#   - 内存锁表管理（授权列表、等待队列）
-#   - 线程安全客户端 API
-#
-# 产出: libtreelock_core.a (静态库)
-# 依赖: pthread (系统库), treelock_types.h (本模块)
+# 产出: libtreelock_core (静态或动态)
+# 依赖: treelock_log, pthread
 # ============================================================================
 
 set(MODULE_NAME treelock_core)
@@ -20,18 +14,20 @@ set(MODULE_SOURCES
     src/client.c
 )
 
-# ── 头文件 ──
+# ── 公共头文件 ──
 set(MODULE_PUBLIC_HEADERS
     include/treelock.h
     include/treelock_types.h
+    include/treelock_platform.h
 )
 
+# ── 私有头文件 ──
 set(MODULE_PRIVATE_HEADERS
     src/internal.h
 )
 
-# ── 构建静态库 ──
-add_library(${MODULE_NAME} STATIC
+# ── 构建库 ──
+add_library(${MODULE_NAME} ${TREELOCK_LIB_TYPE}
     ${MODULE_SOURCES}
     ${MODULE_PUBLIC_HEADERS}
     ${MODULE_PRIVATE_HEADERS}
@@ -49,14 +45,24 @@ target_include_directories(${MODULE_NAME}
 target_link_libraries(${MODULE_NAME}
     PUBLIC
         treelock_log
-        pthread
+        Threads::Threads
 )
 
-# ── 安装规则 ──
+# ── 警告 ──
+set_project_warnings(${MODULE_NAME})
+
+# ── 平台定义 ──
+if(WIN32)
+    target_compile_definitions(${MODULE_NAME} PRIVATE _WIN32_WINNT=0x0600)
+endif()
+
+# ── 安装 ──
 install(TARGETS ${MODULE_NAME}
-    ARCHIVE DESTINATION lib
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
 install(FILES ${MODULE_PUBLIC_HEADERS}
-    DESTINATION include/${MODULE_NAME}
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/${MODULE_NAME}
 )

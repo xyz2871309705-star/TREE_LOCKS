@@ -2,21 +2,24 @@ cmake_minimum_required(VERSION 3.16)
 project(TreeLocks VERSION 0.1.0 LANGUAGES C)
 
 # ============================================================================
-# 编译选项
+# 平台检测
+# ============================================================================
+if(WIN32)
+    set(TREELOCK_PLATFORM "windows")
+elseif(APPLE)
+    set(TREELOCK_PLATFORM "macos")
+else()
+    set(TREELOCK_PLATFORM "linux")
+endif()
+message(STATUS "Target platform: ${TREELOCK_PLATFORM} (${CMAKE_SYSTEM_NAME})")
+message(STATUS "C compiler:      ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION}")
+
+# ============================================================================
+# 编译标准
 # ============================================================================
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_C_EXTENSIONS OFF)
-
-# 编译警告
-# 注意：不使用 -Wpedantic，因为日志宏依赖 GNU 扩展 ##__VA_ARGS__
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(-Wall -Wextra -Wshadow -Wconversion)
-endif()
-
-if(MSVC)
-    add_compile_options(/W4)
-endif()
+set(CMAKE_C_EXTENSIONS ON)  # 需要 GNU 扩展 (##__VA_ARGS__, pthread)
 
 # ============================================================================
 # 构建类型
@@ -27,25 +30,55 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ============================================================================
-# 全局头文件路径
+# 库类型选项
 # ============================================================================
-# 模块公共头文件汇总目录（方便 IDE 索引）
-file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/include)
+option(TREELOCK_BUILD_SHARED "Build shared libraries (.dll/.so) instead of static" OFF)
+
+if(TREELOCK_BUILD_SHARED)
+    set(TREELOCK_LIB_TYPE SHARED)
+    # 构建 DLL 时设置 TREELOCK_BUILD_DLL 以启用 dllexport
+    add_compile_definitions(TREELOCK_BUILD_DLL)
+else()
+    set(TREELOCK_LIB_TYPE STATIC)
+    add_compile_definitions(TREELOCK_STATIC)
+endif()
+message(STATUS "Library type:     ${TREELOCK_LIB_TYPE}")
+
+# ============================================================================
+# 线程库查找（跨平台）
+# ============================================================================
+find_package(Threads REQUIRED)
+if(CMAKE_USE_PTHREADS_INIT)
+    message(STATUS "Thread library:   pthread (via FindThreads)")
+elseif(CMAKE_USE_WIN32_THREADS_INIT)
+    message(STATUS "Thread library:   Win32 threads")
+endif()
+
+# ============================================================================
+# 导入通用模块
+# ============================================================================
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+include(CompilerWarnings)
+
+# ============================================================================
+# 安装路径（遵循 GNU 标准）
+# ============================================================================
+include(GNUInstallDirs)
 
 # ============================================================================
 # 子模块
 # ============================================================================
 
-# 模块 0: 日志模块（所有模块的基础依赖）
+# 模块 0: 日志模块
 add_subdirectory(modules/treelock_log)
 
-# 模块 1: 核心锁协议与客户端 API（阶段一）
+# 模块 1: 核心锁协议与客户端 API
 add_subdirectory(modules/treelock_core)
 
-# 模块 2: 通信层（阶段二/三占位，不产出编译目标）
+# 模块 2: 通信层（阶段二/三占位）
 add_subdirectory(modules/treelock_comm)
 
-# 模块 3: 服务端（阶段三占位，不产出编译目标）
+# 模块 3: 服务端（阶段三占位）
 add_subdirectory(modules/treelock_server)
 
 # ============================================================================
@@ -64,3 +97,13 @@ if(TREELOCK_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+# ============================================================================
+# 构建信息摘要
+# ============================================================================
+message(STATUS "")
+message(STATUS "TreeLocks ${PROJECT_VERSION} configured:")
+message(STATUS "  Build type:   ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Examples:     ${TREELOCK_BUILD_EXAMPLES}")
+message(STATUS "  Tests:        ${TREELOCK_BUILD_TESTS}")
+message(STATUS "  Install dir:  ${CMAKE_INSTALL_PREFIX}")

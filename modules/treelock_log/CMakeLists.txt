@@ -1,14 +1,8 @@
 # ============================================================================
 # 模块: treelock_log — 日志模块
 #
-# 职责:
-#   - 6 级日志等级（FATAL/ERROR/WARN/INFO/DEBUG/TRACE）
-#   - 编译期 + 运行期双重输出控制
-#   - 外部回调注册（自定义日志输出）
-#   - 线程安全 + 递归保护
-#
-# 产出: libtreelock_log.a (静态库)
-# 依赖: treelock_types.h（类型封装宏）, pthread（线程安全）
+# 产出: libtreelock_log (静态或动态)
+# 依赖: treelock_types.h + treelock_platform.h, pthread
 # ============================================================================
 
 set(MODULE_NAME treelock_log)
@@ -18,7 +12,6 @@ set(MODULE_SOURCES
     src/log_core.c
 )
 
-# ── 头文件 ──
 set(MODULE_PUBLIC_HEADERS
     include/treelock_log.h
 )
@@ -27,8 +20,8 @@ set(MODULE_PRIVATE_HEADERS
     src/log_internal.h
 )
 
-# ── 构建静态库 ──
-add_library(${MODULE_NAME} STATIC
+# ── 构建库 ──
+add_library(${MODULE_NAME} ${TREELOCK_LIB_TYPE}
     ${MODULE_SOURCES}
     ${MODULE_PUBLIC_HEADERS}
     ${MODULE_PRIVATE_HEADERS}
@@ -38,7 +31,7 @@ add_library(${MODULE_NAME} STATIC
 target_include_directories(${MODULE_NAME}
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_SOURCE_DIR}/modules/treelock_core/include  # treelock_types.h
+        ${CMAKE_SOURCE_DIR}/modules/treelock_core/include
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
@@ -46,20 +39,30 @@ target_include_directories(${MODULE_NAME}
 # ── 链接依赖 ──
 target_link_libraries(${MODULE_NAME}
     PUBLIC
-        pthread
+        Threads::Threads
 )
 
-# ── 编译定义：Release 构建裁掉 DEBUG/TRACE ──
+# ── 警告 ──
+set_project_warnings(${MODULE_NAME})
+
+# ── 平台定义 ──
+if(WIN32)
+    target_compile_definitions(${MODULE_NAME} PRIVATE _WIN32_WINNT=0x0600)
+endif()
+
+# ── Release 构建裁剪 DEBUG/TRACE ──
 target_compile_definitions(${MODULE_NAME}
     PRIVATE
         $<$<CONFIG:Release>:NDEBUG>
 )
 
-# ── 安装规则 ──
+# ── 安装 ──
 install(TARGETS ${MODULE_NAME}
-    ARCHIVE DESTINATION lib
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
 install(FILES ${MODULE_PUBLIC_HEADERS}
-    DESTINATION include/${MODULE_NAME}
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/${MODULE_NAME}
 )
