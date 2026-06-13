@@ -158,8 +158,13 @@ TREE_LOCKS/
 │
 └── examples/                     # 示例
     ├── CMakeLists.txt
-    ├── basic_usage.c                 # 4 个基础使用示例
-    └── log_callback_demo.c           # 日志回调注册示例
+    ├── src/
+    │   ├── basic_usage.c                 # 4 个基础使用示例
+    │   ├── log_callback_demo.c           # 日志回调注册示例
+    │   └── tree_usage.c                  # 树结构管理示例 (4 场景)
+    └── json/
+        ├── filesystem_tree.json          # 嵌套格式 JSON 树定义
+        └── filesystem_tree_flat.json     # 扁平格式 JSON 树定义
 ```
 
 ### 3.2 模块依赖关系

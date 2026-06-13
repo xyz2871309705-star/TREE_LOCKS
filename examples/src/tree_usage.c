@@ -21,13 +21,13 @@
 /* =========================================================================
  * 示例 1: 从嵌套 JSON 文件加载 + 路径加锁
  *
- * 使用 examples/filesystem_tree.json (嵌套格式)
+ * 使用 examples/json/filesystem_tree.json (嵌套格式)
  * ========================================================================= */
 
 static VOID example_nested_json_file(VOID)
 {
     treelock_t *tl;
-    CSTR_PTR    tree_file = "filesystem_tree.json";
+    CSTR_PTR    tree_file = "json/filesystem_tree.json";
 
     printf("\n========== 示例 1: 嵌套 JSON 文件 + 路径加锁 ==========\n");
 
@@ -84,14 +84,14 @@ static VOID example_nested_json_file(VOID)
 /* =========================================================================
  * 示例 2: 从扁平 JSON 文件加载 + 验证等价性
  *
- * 使用 examples/filesystem_tree_flat.json (扁平格式)
+ * 使用 examples/json/filesystem_tree_flat.json (扁平格式)
  * 演示与嵌套格式定义完全相同的树结构。
  * ========================================================================= */
 
 static VOID example_flat_json_file(VOID)
 {
     treelock_t *tl;
-    CSTR_PTR    tree_file = "filesystem_tree_flat.json";
+    CSTR_PTR    tree_file = "json/filesystem_tree_flat.json";
     treelock_node_id_t node_id;
 
     printf("\n========== 示例 2: 扁平 JSON 文件 + 等价验证 ==========\n");

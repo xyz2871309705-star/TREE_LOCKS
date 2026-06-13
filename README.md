@@ -139,11 +139,13 @@ TREE_LOCKS/
 │   └── test_tree.c                 # 树结构管理 (51 用例)
 │
 └── examples/
-    ├── basic_usage.c               # 基础使用 (4 示例)
-    ├── log_callback_demo.c         # 日志回调注册
-    ├── tree_usage.c                # 树结构管理 (4 示例)
-    ├── filesystem_tree.json        # 嵌套格式 JSON 树定义 (9 节点)
-    └── filesystem_tree_flat.json   # 扁平格式 JSON 树定义 (9 节点)
+    ├── src/
+    │   ├── basic_usage.c               # 基础使用 (4 示例)
+    │   ├── log_callback_demo.c         # 日志回调注册
+    │   └── tree_usage.c                # 树结构管理 (4 示例)
+    └── json/
+        ├── filesystem_tree.json        # 嵌套格式 JSON 树定义 (9 节点)
+        └── filesystem_tree_flat.json   # 扁平格式 JSON 树定义 (9 节点)
 ```
 
 ---
