@@ -31,3 +31,8 @@ target_include_directories(test_concurrent
         ${CMAKE_SOURCE_DIR}/modules/treelock_core/src
 )
 add_test(NAME test_concurrent COMMAND test_concurrent)
+
+# ── 测试: 树结构管理 ──
+add_executable(test_tree test_tree.c)
+target_link_libraries(test_tree PRIVATE treelock_tree)
+add_test(NAME test_tree COMMAND test_tree)

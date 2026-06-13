@@ -1,6 +1,6 @@
 # TreeLocks — 开发者文档
 
-> 版本: 0.1.0 | 状态: 阶段一开发中 | 更新: 2026-06-13
+> 版本: 0.2.0 | 状态: 阶段一 Iteration 1.5 完成 | 更新: 2026-06-13
 
 ---
 
@@ -115,6 +115,23 @@ TREE_LOCKS/
 │   │       ├── lock_table.c          # 锁表管理 (授权列表、等待队列、FIFO 唤醒)
 │   │       └── client.c              # 客户端 API 实现 (线程安全、引用计数)
 │   │
+│   ├── treelock_tree/             # 模块 1.5: 树结构管理 [Iteration 1.5 ✅]
+│   │   ├── CMakeLists.txt
+│   │   ├── include/
+│   │   │   └── treelock_tree.h        # 公共 API (树加载/路径加锁/查询)
+│   │   └── src/
+│   │       ├── tree_internal.h        # 内部数据结构 (hash 表/树索引/桥接)
+│   │       ├── tree_core.c            # 树节点管理 + hash 表 CRUD
+│   │       ├── tree_json.c            # JSON 解析 (扁平/嵌套双格式)
+│   │       ├── tree_validate.c        # 树结构校验 (环检测/ID 唯一/单根)
+│   │       ├── tree_path.c            # 路径解析 + 祖先锁推导
+│   │       └── tree_api.c             # 公共 API 桥接 (文件读取/树加载/路径加锁)
+│   │
+│   ├── cjson/                     # 第三方: cJSON v1.7.18 (MIT License)
+│   │   ├── CMakeLists.txt
+│   │   ├── cJSON.h
+│   │   └── cJSON.c
+│   │
 │   ├── treelock_comm/            # 模块 2: 通信层 [阶段二/三 占位]
 │   │   ├── CMakeLists.txt
 │   │   ├── include/
@@ -153,10 +170,20 @@ TREE_LOCKS/
                     │  (日志模块)   │     仅依赖 pthread + C 标准库
                     └──────┬───────┘
                            │ 依赖
-                    ┌──────▼───────┐
-                    │ treelock_core │  ← 模块 1: 核心库 [阶段一]
-                    │  (锁协议+API) │     依赖: treelock_log + pthread
-                    └──────────────┘
+            ┌──────────────┼──────────────┐
+            │              │              │
+    ┌───────▼──────┐ ┌─────▼──────┐ ┌─────▼──────┐
+    │ treelock_core│ │ cjson      │ │ 其他模块   │
+    │ (锁协议+API) │ │ (第三方)   │ │            │
+    └───────┬──────┘ └─────┬──────┘ └────────────┘
+            │              │
+            └──────┬───────┘
+                   │ 依赖
+          ┌────────▼────────┐
+          │  treelock_tree   │  ← 模块 1.5: 树结构管理 [阶段一]
+          │  (JSON加载+路径  │     依赖: treelock_core + cjson
+          │   加锁+协议校验) │
+          └─────────────────┘
 
 未来阶段:
   treelock_core ──→ treelock_comm ──→ treelock_server
@@ -356,7 +383,61 @@ treelock_t (客户端实例)
   └── held_mutex / table_mutex
 ```
 
-### 5.3 treelock_platform — 平台抽象层
+### 5.3 treelock_tree — 树结构管理
+
+**产出**: `libtreelock_tree.a`
+
+**职责**: JSON 树定义加载、路径加锁/解锁、协议自动校验。
+
+**关键特性**:
+- **双格式 JSON**: 支持扁平 `[{"id":...}]` 和嵌套 `{"tree":...}` 两种格式
+- **树结构校验**: ID 唯一性、parent 有效性、单根节点、环路检测
+- **协议自动校验**: lock 时自动检查父节点是否持有适当的意向锁（IS/IX）
+- **路径加锁**: `treelock_lock_path(tl, "/home/alice", X)` 自动沿祖先路由，为祖先节点获取适当的意向锁
+- **向后兼容**: 未加载树时协议校验跳过，现有代码不受影响
+- **hash 表索引**: 256 桶链式 hash 实现 O(1) 节点查找
+
+**公共 API**:
+
+```c
+// L1: 树加载
+int treelock_load_tree_from_file(tl, "tree.json");
+int treelock_load_tree_from_string(tl, json_str);
+int treelock_register_node(tl, node_id, parent_id, label);
+
+// L2: 路径加锁
+int treelock_lock_path(tl, "/home/alice", TREELOCK_X);
+int treelock_unlock_path(tl, "/home/alice");
+
+// 查询
+int treelock_get_parent(tl, node_id, &parent_id);
+int treelock_lookup_path(tl, "/home/alice", &node_id);
+int treelock_tree_loaded(tl);
+```
+
+**内部架构**:
+
+```
+treelock_tree.h (公共 API)
+      │
+      ▼
+tree_api.c ── 桥接 treelock_core 与 tree_index
+      │
+      ├── tree_json.c      ── JSON 解析 (依赖 cJSON)
+      ├── tree_validate.c  ── 树结构校验 (5 项检查)
+      ├── tree_core.c      ── 树索引管理 (hash 表 CRUD)
+      └── tree_path.c      ── 路径解析 + 祖先锁推导
+```
+
+**与 treelock_core 的桥接**:
+
+`treelock_s` 新增两个字段:
+- `void *tree_data` — 指向 `treelock_tree_index_t` 的不透明指针
+- `treelock_tree_get_parent_fn tree_get_parent` — 父节点查询回调
+
+树模块通过 `tree_data` 注入索引，通过 `tree_get_parent` 回调让 `treelock_validate_protocol()` 在 `_do_lock_core()` 中自动执行协议校验。
+
+### 5.4 treelock_platform — 平台抽象层
 
 **职责**：统一 Windows / Linux / macOS 平台差异。
 
@@ -379,7 +460,7 @@ VOID         treelock_platform_local_time(...);     // 本地时间格式化
 
 | 阶段 | 状态 | 内容 | 代码量 (估) |
 |------|------|------|-------------|
-| **阶段一** | ✅ 开发中 | 单机版库：协议层 + 锁表 + 客户端 API | ~2500 行 |
+| **阶段一** | ✅ 80% | 单机版库：协议 + 锁表 + 客户端 + 树结构管理 | ~3500 行 |
 | **阶段二** | 📋 规划 | ZK 集成版：分布式协调 + Watch 回调 | +~2500 行 |
 | **阶段三** | 📋 规划 | 自研服务版：Raft + gRPC + 租约管理 | +~6000 行 |
 
@@ -392,6 +473,7 @@ VOID         treelock_platform_local_time(...);     // 本地时间格式化
 - [x] 统一日志模块 (6 级 + 外部回调)
 - [x] 跨平台构建 (Windows/Linux/macOS)
 - [x] 12 个协议测试 + 3 个并发测试
+- [x] 树结构管理 (JSON 加载 + 路径加锁 + 协议自动校验) ← Iteration 1.5
 
 ---
 
@@ -403,6 +485,7 @@ VOID         treelock_platform_local_time(...);     // 本地时间格式化
 |------|--------|------|
 | `tests/test_protocol.c` | 12 | 兼容矩阵、模式转换、升级/降级路径 |
 | `tests/test_concurrent.c` | 3 | 多客户端并发、共享实例一致性、锁升级竞态 |
+| `tests/test_tree.c` | 51 | JSON 解析、树校验、协议自动执行、路径加锁、向后兼容 |
 
 ### 7.2 运行测试
 
