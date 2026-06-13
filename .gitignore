@@ -32,6 +32,7 @@ CTestTestfile.cmake
 Testing/
 
 # clangd
+.clangd
 .clangd/cache/
 .cache/
 
