@@ -68,6 +68,53 @@ TEST(CompatMatrix, S_OnlyCompatibleWithNL_IS_S)
     EXPECT_FALSE(treelock_mode_compatible(TREELOCK_S, TREELOCK_X));
 }
 
+TEST(CompatMatrix, SIX_OnlyCompatibleWithNL_IS)
+{
+    EXPECT_TRUE (treelock_mode_compatible(TREELOCK_SIX, TREELOCK_NL));
+    EXPECT_TRUE (treelock_mode_compatible(TREELOCK_SIX, TREELOCK_IS));
+    EXPECT_FALSE(treelock_mode_compatible(TREELOCK_SIX, TREELOCK_IX));
+    EXPECT_FALSE(treelock_mode_compatible(TREELOCK_SIX, TREELOCK_S));
+    EXPECT_FALSE(treelock_mode_compatible(TREELOCK_SIX, TREELOCK_SIX));
+    EXPECT_FALSE(treelock_mode_compatible(TREELOCK_SIX, TREELOCK_X));
+}
+
+TEST(CompatMatrix, FullMatrix)
+{
+    /* 遍历所有 36 个组合，对照 Gray 6-mode 标准矩阵 */
+    struct { treelock_mode_t existing; treelock_mode_t requested; int expected; } cases[] = {
+        /* NL 持有方 → 所有请求都兼容 */
+        {TREELOCK_NL, TREELOCK_NL,  1}, {TREELOCK_NL, TREELOCK_IS,  1},
+        {TREELOCK_NL, TREELOCK_IX,  1}, {TREELOCK_NL, TREELOCK_S,   1},
+        {TREELOCK_NL, TREELOCK_SIX, 1}, {TREELOCK_NL, TREELOCK_X,   1},
+        /* IS 持有方 → 只有 X 不兼容 */
+        {TREELOCK_IS, TREELOCK_NL,  1}, {TREELOCK_IS, TREELOCK_IS,  1},
+        {TREELOCK_IS, TREELOCK_IX,  1}, {TREELOCK_IS, TREELOCK_S,   1},
+        {TREELOCK_IS, TREELOCK_SIX, 1}, {TREELOCK_IS, TREELOCK_X,   0},
+        /* IX 持有方 → 只有 NL/IS/IX 兼容 */
+        {TREELOCK_IX, TREELOCK_NL,  1}, {TREELOCK_IX, TREELOCK_IS,  1},
+        {TREELOCK_IX, TREELOCK_IX,  1}, {TREELOCK_IX, TREELOCK_S,   0},
+        {TREELOCK_IX, TREELOCK_SIX, 0}, {TREELOCK_IX, TREELOCK_X,   0},
+        /* S 持有方 → 只有 NL/IS/S 兼容 */
+        {TREELOCK_S, TREELOCK_NL,  1}, {TREELOCK_S, TREELOCK_IS,  1},
+        {TREELOCK_S, TREELOCK_IX,  0}, {TREELOCK_S, TREELOCK_S,   1},
+        {TREELOCK_S, TREELOCK_SIX, 0}, {TREELOCK_S, TREELOCK_X,   0},
+        /* SIX 持有方 → 只有 NL/IS 兼容 */
+        {TREELOCK_SIX, TREELOCK_NL,  1}, {TREELOCK_SIX, TREELOCK_IS,  1},
+        {TREELOCK_SIX, TREELOCK_IX,  0}, {TREELOCK_SIX, TREELOCK_S,   0},
+        {TREELOCK_SIX, TREELOCK_SIX, 0}, {TREELOCK_SIX, TREELOCK_X,   0},
+        /* X 持有方 → 只有 NL 兼容 */
+        {TREELOCK_X, TREELOCK_NL,  1}, {TREELOCK_X, TREELOCK_IS,  0},
+        {TREELOCK_X, TREELOCK_IX,  0}, {TREELOCK_X, TREELOCK_S,   0},
+        {TREELOCK_X, TREELOCK_SIX, 0}, {TREELOCK_X, TREELOCK_X,   0},
+    };
+    for (auto &c : cases) {
+        EXPECT_EQ(treelock_mode_compatible(c.existing, c.requested), c.expected)
+            << "compat(" << treelock_mode_name(c.existing)
+            << ", " << treelock_mode_name(c.requested) << ") should be "
+            << c.expected;
+    }
+}
+
 /* =========================================================================
  * 父节点锁模式
  * ========================================================================= */
@@ -80,6 +127,39 @@ TEST(RequiredParentMode, AllModes)
     EXPECT_EQ(treelock_required_parent_mode(TREELOCK_S),   TREELOCK_IS);
     EXPECT_EQ(treelock_required_parent_mode(TREELOCK_SIX), TREELOCK_IX);
     EXPECT_EQ(treelock_required_parent_mode(TREELOCK_X),   TREELOCK_IX);
+}
+
+/* =========================================================================
+ * 越界参数处理
+ * ========================================================================= */
+
+TEST(Boundary, ModeCompatibleOutOfRange)
+{
+    /* 超出 TREELOCK_MODE_MAX 的值应返回 FALSE，不崩溃 */
+    EXPECT_FALSE(treelock_mode_compatible((treelock_mode_t)99, TREELOCK_IS));
+    EXPECT_FALSE(treelock_mode_compatible(TREELOCK_IS, (treelock_mode_t)99));
+    EXPECT_FALSE(treelock_mode_compatible((treelock_mode_t)99, (treelock_mode_t)99));
+    /* 负值也应安全处理 */
+    EXPECT_FALSE(treelock_mode_compatible((treelock_mode_t)(-1), TREELOCK_IS));
+}
+
+TEST(Boundary, RequiredParentModeOutOfRange)
+{
+    EXPECT_EQ(treelock_required_parent_mode((treelock_mode_t)99), TREELOCK_NL);
+    EXPECT_EQ(treelock_required_parent_mode((treelock_mode_t)(-1)), TREELOCK_NL);
+}
+
+TEST(Boundary, EscalateValidOutOfRange)
+{
+    EXPECT_FALSE(treelock_escalate_valid((treelock_mode_t)99, TREELOCK_S));
+    EXPECT_FALSE(treelock_escalate_valid(TREELOCK_IS, (treelock_mode_t)99));
+    EXPECT_FALSE(treelock_escalate_valid((treelock_mode_t)99, (treelock_mode_t)99));
+}
+
+TEST(Boundary, DowngradeValidOutOfRange)
+{
+    EXPECT_FALSE(treelock_downgrade_valid((treelock_mode_t)99, TREELOCK_NL));
+    EXPECT_FALSE(treelock_downgrade_valid(TREELOCK_X, (treelock_mode_t)99));
 }
 
 /* =========================================================================
@@ -176,4 +256,10 @@ TEST(Utils, StrError)
     EXPECT_GT(strlen(treelock_strerror(TREELOCK_ERR_NETWORK)),  0u);
     EXPECT_GT(strlen(treelock_strerror(TREELOCK_ERR_STALE)),    0u);
     EXPECT_GT(strlen(treelock_strerror(TREELOCK_ERR_INVAL)),    0u);
+}
+
+TEST(Utils, StrErrorUnknownCode)
+{
+    EXPECT_STREQ(treelock_strerror(999), "Unknown error");
+    EXPECT_STREQ(treelock_strerror(-100), "Unknown error");
 }

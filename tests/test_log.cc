@@ -305,3 +305,55 @@ TEST_F(LogFileTest, TimestampFormat)
     EXPECT_EQ(colons, 2);
     EXPECT_EQ(dots,   1);
 }
+
+/* =========================================================================
+ * 等级名称
+ * ========================================================================= */
+
+TEST_F(LogFileTest, LevelName)
+{
+    EXPECT_STREQ(treelock_log_level_name(TREELOCK_LOG_OFF),   "OFF");
+    EXPECT_STREQ(treelock_log_level_name(TREELOCK_LOG_FATAL), "FATAL");
+    EXPECT_STREQ(treelock_log_level_name(TREELOCK_LOG_ERROR), "ERROR");
+    EXPECT_STREQ(treelock_log_level_name(TREELOCK_LOG_WARN),  "WARN");
+    EXPECT_STREQ(treelock_log_level_name(TREELOCK_LOG_INFO),  "INFO");
+    EXPECT_STREQ(treelock_log_level_name(TREELOCK_LOG_DEBUG), "DEBUG");
+    EXPECT_STREQ(treelock_log_level_name(TREELOCK_LOG_TRACE), "TRACE");
+    EXPECT_STREQ(treelock_log_level_name((treelock_log_level_t)99), "UNKNOWN");
+}
+
+/* =========================================================================
+ * Get/Set Level 往返
+ * ========================================================================= */
+
+TEST_F(LogFileTest, GetSetLevelRoundtrip)
+{
+    treelock_log_set_level(TREELOCK_LOG_WARN);
+    EXPECT_EQ(treelock_log_get_level(), TREELOCK_LOG_WARN);
+
+    treelock_log_set_level(TREELOCK_LOG_TRACE);
+    EXPECT_EQ(treelock_log_get_level(), TREELOCK_LOG_TRACE);
+
+    treelock_log_set_level(TREELOCK_LOG_OFF);
+    EXPECT_EQ(treelock_log_get_level(), TREELOCK_LOG_OFF);
+
+    /* 恢复默认以便后续测试 */
+    treelock_log_set_level(TREELOCK_LOG_TRACE);
+}
+
+/* =========================================================================
+ * Get/Set Callback 查询
+ * ========================================================================= */
+
+TEST_F(LogFileTest, GetSetCallback)
+{
+    /* 默认回调应为非 NULL（内置 stderr 回调或 NULL） */
+    treelock_log_callback_t orig = treelock_log_get_callback();
+
+    treelock_log_set_callback(test_callback, nullptr);
+    EXPECT_EQ(treelock_log_get_callback(), test_callback);
+
+    /* 恢复 */
+    treelock_log_set_callback(orig, nullptr);
+    EXPECT_EQ(treelock_log_get_callback(), orig);
+}
