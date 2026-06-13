@@ -4,11 +4,16 @@
 # 此文件提供额外的静态分析和索引配置。
 
 CompileFlags:
-  # 追加全局编译标志（所有翻译单元通用）
+  # 追加全局编译标志
   Add:
     - "-DTREELOCK_STATIC"
     - "-D_WIN32_WINNT=0x0600"
     - "-std=gnu11"
+    # MinGW 系统头文件路径（clangd 需要手动指定）
+    - "-isystem"
+    - "D:/App/CLion/CLion 2025.1.4/bin/mingw/x86_64-w64-mingw32/include"
+    - "-isystem"
+    - "D:/App/CLion/CLion 2025.1.4/bin/mingw/lib/gcc/x86_64-w64-mingw32/13.1.0/include"
 
   # 移除导致误报的标志
   Remove:
