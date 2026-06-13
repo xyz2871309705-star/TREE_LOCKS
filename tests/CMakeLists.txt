@@ -14,6 +14,15 @@ target_include_directories(test_protocol
 )
 add_test(NAME test_protocol COMMAND test_protocol)
 
+# ── 测试: 日志模块 ──
+add_executable(test_log test_log.c)
+target_link_libraries(test_log PRIVATE treelock_log)
+target_include_directories(test_log
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/modules/treelock_log/src
+)
+add_test(NAME test_log COMMAND test_log)
+
 # ── 测试: 并发压力 ──
 add_executable(test_concurrent test_concurrent.c)
 target_link_libraries(test_concurrent PRIVATE treelock_core)

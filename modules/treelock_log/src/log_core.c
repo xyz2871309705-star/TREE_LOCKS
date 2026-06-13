@@ -7,9 +7,10 @@
 
 #include "log_internal.h"
 
-#include <stdio.h>   /* vfprintf, stderr, FILE */
-#include <string.h>  /* strlen, strncpy */
+#include <stdio.h>   /* vfprintf, stderr, FILE, fopen, fclose */
+#include <string.h>  /* strlen, strncpy, strncpy */
 #include <stdlib.h>  /* NULL */
+#include <errno.h>   /* errno */
 
 /* =========================================================================
  * 全局日志上下文（单例）
@@ -21,7 +22,9 @@ treelock_log_context_t g_log_ctx = {
     NULL,                /* callback_data  */
     PTHREAD_MUTEX_INITIALIZER,
     TRUE,                /* initialized    */
-    FALSE                /* recursion_guard */
+    FALSE,               /* recursion_guard */
+    NULL,                /* log_file       — 默认无文件输出 */
+    ""                   /* log_file_path  — 默认空路径 */
 };
 
 /* =========================================================================
@@ -182,6 +185,54 @@ VOID _log_default_callback(
             (func_name != NULL) ? func_name : "???",
             reset,
             (message != NULL) ? message : "");
+}
+
+/**
+ * 函数名称：_log_write_to_file
+ *
+ * 功能描述：将日志写入文件（无 ANSI 颜色码）
+ *
+ *          格式与默认回调一致，但去掉颜色转义码，
+ *          适合文件持久化和日志分析工具解析。
+ *
+ *          格式: [时间戳] [等级] [标签] 文件:行 函数() 消息
+ *
+ * @param[IN] level     - 日志等级
+ * @param[IN] tag       - 模块标签
+ * @param[IN] file      - 源文件名
+ * @param[IN] line      - 行号
+ * @param[IN] func_name - 函数名
+ * @param[IN] message   - 格式化后的消息
+ */
+static VOID _log_write_to_file(
+    IN treelock_log_level_t  level,
+    IN CSTR_PTR              tag,
+    IN CSTR_PTR              file,
+    IN INT_32                line,
+    IN CSTR_PTR              func_name,
+    IN CSTR_PTR              message)
+{
+    CHAR    time_buf[TREELOCK_LOG_TIME_BUF];
+    CSTR_PTR short_file;
+    FILE   *fp;
+
+    if (g_log_ctx.log_file == NULL) {
+        return;
+    }
+
+    _log_format_timestamp(time_buf, sizeof(time_buf));
+    short_file = _log_short_file(file);
+    fp = g_log_ctx.log_file;
+
+    fprintf(fp, "[%s] [%-5s] [%-8s] %s:%-4d %s() %s\n",
+            time_buf,
+            g_level_names[level],
+            (tag != NULL) ? tag : "-",
+            (short_file != NULL) ? short_file : "???",
+            line,
+            (func_name != NULL) ? func_name : "???",
+            (message != NULL) ? message : "");
+    fflush(fp);
 }
 
 /* =========================================================================
@@ -364,7 +415,109 @@ VOID treelock_log_write_va(
                               msg_buf, NULL);
     }
 
+    /* ── 写入文件（与回调解耦，文件输出不受回调影响） ── */
+    _log_write_to_file(level, tag, file, line, func_name, msg_buf);
+
     /* ── 解锁 ── */
     g_log_ctx.recursion_guard = FALSE;
     pthread_mutex_unlock(&g_log_ctx.mutex);
+}
+
+/* =========================================================================
+ * 文件输出 API 实现
+ * ========================================================================= */
+
+/**
+ * 函数名称：treelock_log_set_file
+ *
+ * 功能描述：设置日志输出文件
+ *
+ *          打开指定文件用于日志输出（追加模式）。
+ *          日志会同时写入此文件和 stderr（或用户回调）。
+ *
+ *          传入 NULL 或空字符串等效于 treelock_log_close_file()。
+ *          若之前已打开文件，会先关闭旧文件再打开新文件。
+ *
+ * @param[IN] filename - 日志文件路径（NULL 或空串 = 关闭文件输出）
+ *
+ * @return TRUE 成功打开文件，FALSE 打开失败
+ */
+BOOL treelock_log_set_file(
+    IN CSTR_PTR filename)
+{
+    FILE *new_fp = NULL;
+
+    /* ── 空路径 = 关闭文件 ── */
+    if (filename == NULL || filename[0] == '\0') {
+        treelock_log_close_file();
+        return TRUE;
+    }
+
+    /* ── 打开新文件（追加模式） ── */
+    new_fp = fopen(filename, "a");
+    if (new_fp == NULL) {
+        return FALSE;  /* 打开失败，保留旧文件不变 */
+    }
+
+    /* ── 加锁，替换文件句柄 ── */
+    pthread_mutex_lock(&g_log_ctx.mutex);
+
+    /* 关闭旧文件 */
+    if (g_log_ctx.log_file != NULL) {
+        fclose(g_log_ctx.log_file);
+        g_log_ctx.log_file = NULL;
+    }
+
+    /* 设置新文件 */
+    g_log_ctx.log_file = new_fp;
+    strncpy(g_log_ctx.log_file_path, filename,
+            TREELOCK_LOG_FILE_PATH_MAX - 1);
+    g_log_ctx.log_file_path[TREELOCK_LOG_FILE_PATH_MAX - 1] = '\0';
+
+    pthread_mutex_unlock(&g_log_ctx.mutex);
+    return TRUE;
+}
+
+/**
+ * 函数名称：treelock_log_close_file
+ *
+ * 功能描述：关闭当前日志输出文件
+ *
+ *          关闭后日志不再写入文件，但仍会输出到 stderr（或用户回调）。
+ *          若未开启文件输出，调用此函数无副作用。
+ */
+VOID treelock_log_close_file(VOID)
+{
+    pthread_mutex_lock(&g_log_ctx.mutex);
+
+    if (g_log_ctx.log_file != NULL) {
+        fclose(g_log_ctx.log_file);
+        g_log_ctx.log_file = NULL;
+    }
+    g_log_ctx.log_file_path[0] = '\0';
+
+    pthread_mutex_unlock(&g_log_ctx.mutex);
+}
+
+/**
+ * 函数名称：treelock_log_get_file
+ *
+ * 功能描述：获取当前日志文件路径
+ *
+ * @return 当前日志文件路径字符串；未设置文件时返回 NULL
+ */
+CSTR_PTR treelock_log_get_file(VOID)
+{
+    CSTR_PTR result;
+
+    pthread_mutex_lock(&g_log_ctx.mutex);
+
+    if (g_log_ctx.log_file_path[0] != '\0') {
+        result = g_log_ctx.log_file_path;
+    } else {
+        result = NULL;
+    }
+
+    pthread_mutex_unlock(&g_log_ctx.mutex);
+    return result;
 }
