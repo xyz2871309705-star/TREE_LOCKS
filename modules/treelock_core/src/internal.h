@@ -169,6 +169,12 @@ typedef struct {
  * 客户端主结构
  * ========================================================================= */
 
+/** 树结构父节点查询回调类型（由 treelock_tree 模块注册） */
+typedef treelock_node_id_t (*treelock_tree_get_parent_fn)(
+    PTR_VOID              tree_data,
+    treelock_node_id_t    node_id
+);
+
 struct treelock_s {
     /* ── 配置 ── */
     treelock_config_t   config;        /**< 客户端配置                 */
@@ -186,6 +192,10 @@ struct treelock_s {
     /* ── 回调 ── */
     treelock_lost_cb    lost_cb;       /**< 锁丢失回调函数             */
     PTR_VOID            lost_cb_data;  /**< 回调用户数据               */
+
+    /* ── 树结构桥接（由 treelock_tree 模块注入）── */
+    PTR_VOID                     tree_data;        /**< 不透明树索引指针    */
+    treelock_tree_get_parent_fn  tree_get_parent;  /**< 父节点查询回调      */
 
     /* ── 状态 ── */
     INT_32              connected;     /**< 连接状态（阶段一始终为 TRUE） */

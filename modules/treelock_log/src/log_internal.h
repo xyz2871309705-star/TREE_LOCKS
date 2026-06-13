@@ -32,6 +32,9 @@ extern "C" {
 /** 文件名截取长度（只保留最后 N 个字符） */
 #define TREELOCK_LOG_FILE_TAIL (24)
 
+/** 日志文件路径最大长度 */
+#define TREELOCK_LOG_FILE_PATH_MAX (512)
+
 /* =========================================================================
  * 日志上下文（全局单例）
  * ========================================================================= */
@@ -43,6 +46,8 @@ typedef struct {
     pthread_mutex_t          mutex;          /**< 线程安全锁               */
     INT_32                   initialized;    /**< 初始化标志               */
     INT_32                   recursion_guard;/**< 递归保护（防止回调中死锁） */
+    FILE                    *log_file;       /**< 日志文件句柄（NULL=未开启）*/
+    CHAR                     log_file_path[TREELOCK_LOG_FILE_PATH_MAX]; /**< 日志文件路径 */
 } treelock_log_context_t;
 
 /* =========================================================================

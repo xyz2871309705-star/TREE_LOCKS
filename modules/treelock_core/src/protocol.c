@@ -8,6 +8,7 @@
  */
 
 #include "internal.h"
+#include "treelock_log.h"
 #include <string.h> /* strcmp, strlen */
 
 /* =========================================================================
@@ -228,31 +229,77 @@ CSTR_PTR treelock_strerror(
  *
  * 功能描述：验证加锁协议，检查是否违反自顶向下规则
  *
- *          阶段一简化实现：仅对 node_id == 0（约定根节点）做特殊处理。
- *          未来版本将通过 tree_map 查找 parent_id 并验证祖先锁。
+ *          规则 1：获取 S/IS 前，必须持有父节点的 IS 或更强锁
+ *          规则 2：获取 X/IX/SIX 前，必须持有父节点的 IX 或更强锁
+ *
+ *          如果未加载树结构（tree_data == NULL），则跳过校验，向后兼容。
  *
  * @param[IN] tl      - 锁句柄
  * @param[IN] node_id - 目标节点 ID
  * @param[IN] mode    - 请求的锁模式
  *
  * @return TREELOCK_OK 协议验证通过
+ * @return TREELOCK_ERR_PROTOCOL 违反加锁协议
  */
 RET_CODE treelock_validate_protocol(
     IN treelock_t         *tl,
     IN treelock_node_id_t  node_id,
     IN treelock_mode_t     mode)
 {
-    UNUSED_PARAM(tl);
-    UNUSED_PARAM(mode);
+    treelock_node_id_t parent_id;
+    treelock_mode_t    required;
+    treelock_mode_t    held;
 
-    /* 根节点（node_id == 0 约定）无需父节点锁 */
-    if (node_id == 0) {
+    if (tl == NULL) {
+        return TREELOCK_ERR_INVAL;
+    }
+
+    /* 未加载树结构 → 跳过校验（向后兼容） */
+    if (tl->tree_data == NULL || tl->tree_get_parent == NULL) {
         return TREELOCK_OK;
     }
 
+    /* 查询父节点 */
+    parent_id = tl->tree_get_parent(tl->tree_data, node_id);
+
+    /* 根节点无需父节点锁 */
+    if (parent_id == (treelock_node_id_t)0) {
+        return TREELOCK_OK;
+    }
+
+    /* 获取父节点所需的最小锁模式 */
+    required = treelock_required_parent_mode(mode);
+    if (required == TREELOCK_NL) {
+        return TREELOCK_OK;
+    }
+
+    /* 检查父节点是否持有足够的锁 */
+    held = treelock_get_mode(tl, parent_id);
+
     /*
-     * TODO(阶段二): 通过 tree_map 查找 parent_id，验证是否持有父节点的意向锁。
-     * 阶段一由调用者保证加锁顺序，库仅做基本检查。
+     * 父节点锁强度检查：
+     *   要求 IS → 父节点持有 NL 以外任何锁即可
+     *   要求 IX → 父节点必须持有 IX / SIX / X
      */
+    if (required == TREELOCK_IS) {
+        if (held == TREELOCK_NL) {
+            TREELOCK_LOG_WARN("PROTO",
+                "protocol violation: lock node=%llu (mode=%s) requires "
+                "parent=%llu to hold IS or stronger, but parent holds NL",
+                (unsigned long long)node_id, treelock_mode_name(mode),
+                (unsigned long long)parent_id);
+            return TREELOCK_ERR_PROTOCOL;
+        }
+    } else if (required == TREELOCK_IX) {
+        if (held != TREELOCK_IX && held != TREELOCK_SIX && held != TREELOCK_X) {
+            TREELOCK_LOG_WARN("PROTO",
+                "protocol violation: lock node=%llu (mode=%s) requires "
+                "parent=%llu to hold IX or stronger, but parent holds %s",
+                (unsigned long long)node_id, treelock_mode_name(mode),
+                (unsigned long long)parent_id, treelock_mode_name(held));
+            return TREELOCK_ERR_PROTOCOL;
+        }
+    }
+
     return TREELOCK_OK;
 }

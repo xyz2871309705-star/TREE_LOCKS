@@ -74,6 +74,7 @@ ctest --output-on-failure
 ```bash
 ./examples/basic_usage          # 4 个基础使用示例
 ./examples/log_callback_demo    # 日志回调注册示例
+./examples/tree_usage           # 3 个树结构管理示例
 ```
 
 ---
@@ -102,9 +103,23 @@ TREE_LOCKS/
 │   │   │   ├── treelock_types.h        # 类型封装 (INT_32/IN/OUT 等)
 │   │   │   └── treelock_platform.h     # 平台抽象 (时间/DLL/TLS)
 │   │   └── src/
-│   │       ├── protocol.c              # 兼容矩阵、模式转换
+│   │       ├── protocol.c              # 兼容矩阵、模式转换、协议校验
 │   │       ├── lock_table.c            # 锁表、FIFO 等待队列
 │   │       └── client.c                # 客户端实现 (线程安全+引用计数)
+│   │
+│   ├── treelock_tree/              # 模块 1.5: 树结构管理 [Iteration 1.5 ✅]
+│   │   ├── include/treelock_tree.h     # 公共 API (树加载/路径加锁/查询)
+│   │   └── src/
+│   │       ├── tree_internal.h         # 内部数据结构 (hash 表/树索引)
+│   │       ├── tree_core.c             # 树节点管理 + hash 表操作
+│   │       ├── tree_json.c             # JSON 解析 (扁平/嵌套双格式)
+│   │       ├── tree_validate.c         # 树校验 (ID 唯一/单根/无环)
+│   │       ├── tree_path.c             # 路径解析 + 祖先锁推导
+│   │       └── tree_api.c              # 公共 API 桥接实现
+│   │
+│   ├── cjson/                      # 第三方: cJSON v1.7.18 (MIT License)
+│   │   ├── cJSON.h
+│   │   └── cJSON.c
 │   │
 │   ├── treelock_comm/              # 模块 2: 通信层 [阶段二/三]
 │   └── treelock_server/            # 模块 3: 服务端 [阶段三]
@@ -118,11 +133,13 @@ TREE_LOCKS/
 │
 ├── tests/
 │   ├── test_protocol.c             # 协议正确性 (12 用例)
-│   └── test_concurrent.c           # 并发压力 (3 场景)
+│   ├── test_concurrent.c           # 并发压力 (3 场景)
+│   └── test_tree.c                 # 树结构管理 (51 用例)
 │
 └── examples/
     ├── basic_usage.c               # 基础使用 (4 示例)
-    └── log_callback_demo.c         # 日志回调注册
+    ├── log_callback_demo.c         # 日志回调注册
+    └── tree_usage.c                # 树结构管理 (3 示例)
 ```
 
 ---
@@ -174,6 +191,18 @@ treelock_unlock(tl, dir);
 treelock_unlock(tl, root);
 ```
 
+```c
+/* 树结构管理: 从 JSON 加载树 + 路径加锁 (★ 新增) */
+treelock_load_tree_from_file(tl, "my_tree.json");
+
+// 一行加锁：自动 root(IX) → /home(IX) → /home/alice(X)
+treelock_lock_path(tl, "/home/alice", TREELOCK_X);
+
+// ... 安全写入 alice 的数据 ...
+
+treelock_unlock_path(tl, "/home/alice");
+```
+
 ---
 
 ## API 概览
@@ -199,6 +228,15 @@ int             treelock_query_node(treelock_t *tl, treelock_node_id_t node_id, 
 
 /* ========== 回调 ========== */
 int treelock_set_lost_callback(treelock_t *tl, treelock_lost_cb cb, void *user_data);
+
+/* ========== 树结构管理 (libtreelock_tree) ========== */
+int  treelock_load_tree_from_file(treelock_t *tl, const char *filepath);
+int  treelock_load_tree_from_string(treelock_t *tl, const char *json_string);
+int  treelock_register_node(treelock_t *tl, uint64_t node_id, uint64_t parent_id, const char *label);
+int  treelock_lock_path(treelock_t *tl, const char *path, treelock_mode_t mode);
+int  treelock_unlock_path(treelock_t *tl, const char *path);
+int  treelock_get_parent(treelock_t *tl, uint64_t node_id, uint64_t *parent_id);
+int  treelock_lookup_path(treelock_t *tl, const char *path, uint64_t *node_id);
 ```
 
 ---
@@ -241,7 +279,7 @@ treelock_log_set_level(TREELOCK_LOG_WARN);  // 运行期过滤
 
 | 阶段 | 状态 | 内容 | 代码量 |
 |------|------|------|--------|
-| 阶段一 | 🚧 70% | 单机版库：协议 + 锁表 + 客户端 + 日志 + 跨平台 | ~2500 行 |
+| 阶段一 | 🚧 80% | 单机版库：协议 + 锁表 + 客户端 + 日志 + 树结构 + 跨平台 | ~3500 行 |
 | 阶段二 | 📋 规划 | ZK 协调版：分布式锁协调 + Watch 回调 | +~2500 行 |
 | 阶段三 | 📋 规划 | 自研服务版：Raft + gRPC + 租约管理 | +~6000 行 |
 
@@ -255,7 +293,7 @@ treelock_log_set_level(TREELOCK_LOG_WARN);  // 运行期过滤
 - [x] 统一日志模块 (6 级 + 外部回调)
 - [x] 跨平台构建 (Windows/Linux/macOS)
 - [x] 12 协议测试 + 3 并发测试
-- [ ] 树结构管理 (父子关系 + 协议自动校验) ← **下一步**
+- [x] **树结构管理** (JSON 加载 + 路径加锁 + 协议自动校验) ← **Iteration 1.5 完成**
 - [ ] 租约与故障恢复
 - [ ] 性能基准与内存检测
 
@@ -267,6 +305,7 @@ treelock_log_set_level(TREELOCK_LOG_WARN);  // 运行期过滤
 |------|--------|------|
 | 协议正确性 | 12 | `./build/tests/test_protocol` |
 | 并发压力 | 3 | `./build/tests/test_concurrent` |
+| 树结构管理 | 51 | `./build/tests/test_tree` |
 
 ```
 $ ./tests/test_protocol
@@ -281,6 +320,14 @@ $ ./tests/test_concurrent
   TEST: concurrent consistency (shared instance) ... PASSED
   TEST: concurrent lock escalate ... PASSED
 结果: 3/3 通过, 0 失败
+
+$ ./tests/test_tree
+--- Test 1: manual register_node ---
+  PASS: create client
+  ...
+--- Test 9: backward compatibility (no tree) ---
+  PASS: lock without tree works (backward compat)
+结果: 51/51 通过, 0 失败
 ```
 
 ---

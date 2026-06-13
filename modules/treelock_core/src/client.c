@@ -268,6 +268,12 @@ static RET_CODE _do_lock_core(
         return TREELOCK_ERR_INVAL;
     }
 
+    /* ── 3.5 协议校验（树结构管理）── */
+    rc = treelock_validate_protocol(tl, node_id, mode);
+    if (rc != TREELOCK_OK) {
+        return rc;
+    }
+
     /* ── 4 & 5. 冲突检查 → 授予或等待 ── */
     pthread_mutex_lock(&node->mutex);
 
@@ -456,6 +462,10 @@ VOID treelock_destroy(
     /* 释放所有持有的锁 */
     treelock_unlock_all(tl);
     tl->destroyed = TRUE;
+
+    /* 清空树结构桥接（树模块负责实际内存释放） */
+    tl->tree_data       = NULL;
+    tl->tree_get_parent = NULL;
 
     /* 清理锁表 */
     pthread_mutex_lock(&tl->table_mutex);

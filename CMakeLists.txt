@@ -92,11 +92,17 @@ include(GNUInstallDirs)
 # 子模块
 # ============================================================================
 
+# 第三方: 轻量级 JSON 解析器
+add_subdirectory(modules/cjson)
+
 # 模块 0: 日志模块
 add_subdirectory(modules/treelock_log)
 
 # 模块 1: 核心锁协议与客户端 API
 add_subdirectory(modules/treelock_core)
+
+# 模块 1.5: 树结构管理（JSON 加载 + 路径加锁 + 协议校验）
+add_subdirectory(modules/treelock_tree)
 
 # 模块 2: 通信层（阶段二/三占位）
 add_subdirectory(modules/treelock_comm)
