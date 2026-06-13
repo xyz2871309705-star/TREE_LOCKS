@@ -53,30 +53,47 @@ cd build
 
 ```
 TreeLocks/
-├── CMakeLists.txt              # 顶层 CMake 构建
+├── CMakeLists.txt              # 顶层 CMake（聚合全部模块）
 ├── README.md                   # 本文件
 ├── .gitignore                  # Git 忽略规则
 ├── docs/
 │   └── 设计.md                 # 设计文档
-├── include/
-│   └── treelock.h              # 公共 API 头文件
-├── src/
-│   ├── CMakeLists.txt          # 核心库构建
-│   ├── internal.h              # 内部数据结构
-│   ├── protocol.c              # 兼容矩阵、模式转换
-│   ├── lock_table.c            # 锁表、等待队列
-│   └── client.c                # 客户端 API 实现
+│
+├── modules/                    # ★ 模块目录（每个模块独立 include/ + src/）
+│   ├── treelock_core/          # 模块 1：核心锁协议与客户端 API [阶段一]
+│   │   ├── CMakeLists.txt
+│   │   ├── include/
+│   │   │   ├── treelock.h          # 公共 API 头文件
+│   │   │   └── treelock_types.h    # 基础类型封装（INT_32/IN/OUT 等）
+│   │   └── src/
+│   │       ├── internal.h          # 内部数据结构
+│   │       ├── protocol.c          # 兼容矩阵、模式转换
+│   │       ├── lock_table.c        # 锁表、等待队列
+│   │       └── client.c            # 客户端 API 实现
+│   │
+│   ├── treelock_comm/          # 模块 2：通信层 [阶段二/三，占位]
+│   │   ├── CMakeLists.txt
+│   │   ├── include/
+│   │   │   └── treelock_comm.h     # 通信层 API
+│   │   └── src/                    # (待实现)
+│   │
+│   └── treelock_server/        # 模块 3：锁管理服务端 [阶段三，占位]
+│       ├── CMakeLists.txt
+│       ├── include/
+│       │   └── treelock_server.h   # 服务端 API
+│       └── src/                    # (待实现)
+│
 ├── tests/
-│   ├── CMakeLists.txt          # 测试构建
-│   ├── test_protocol.c         # 协议正确性测试
-│   └── test_concurrent.c       # 并发压力测试
+│   ├── CMakeLists.txt
+│   ├── test_protocol.c         # 协议正确性测试（17 个用例）
+│   └── test_concurrent.c       # 并发压力测试（3 个场景）
+│
 ├── examples/
-│   ├── CMakeLists.txt          # 示例构建
-│   └── basic_usage.c           # 基础使用示例
-├── proto/
-│   └── treelock.proto          # Protobuf 定义（阶段三）
-└── server/
-    └── CMakeLists.txt          # 服务端构建（阶段三）
+│   ├── CMakeLists.txt
+│   └── basic_usage.c           # 4 个使用示例
+│
+└── proto/
+    └── treelock.proto          # Protobuf 通信协议定义
 ```
 
 ## 实现阶段
