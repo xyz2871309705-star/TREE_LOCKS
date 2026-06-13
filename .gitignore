@@ -31,6 +31,10 @@ compile_commands.json
 CTestTestfile.cmake
 Testing/
 
+# clangd
+.clangd/cache/
+.cache/
+
 # Package files
 *.deb
 *.rpm
