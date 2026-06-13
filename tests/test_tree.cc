@@ -2,11 +2,16 @@
  * TreeLocks — 树结构管理单元测试 (GTest)
  *
  * 测试覆盖:
- *   1. JSON 解析（扁平/嵌套格式）
- *   2. 树校验（ID 唯一/单根/无环）
- *   3. 手动注册节点
- *   4. 协议自动校验（lock 时检查祖先锁）
- *   5. 路径加锁/解锁
+ *   1. JSON 解析（扁平/嵌套格式）       — tree_json.c
+ *   2. 树校验（ID 唯一/单根/无环）        — tree_validate.c
+ *   3. 手动注册节点                     — tree_core.c + tree_api.c
+ *   4. 协议自动校验（lock 时检查祖先锁）  — protocol.c + tree_api.c
+ *   5. 路径加锁/解锁                     — tree_path.c + tree_api.c
+ *
+ * 被测源文件:
+ *   modules/treelock_tree/src/tree_api.c, tree_core.c, tree_json.c,
+ *   tree_path.c, tree_validate.c
+ *   modules/treelock_core/src/protocol.c (treelock_validate_protocol)
  *
  * 版本: 0.2.0
  * 日期: 2026-06-13
@@ -23,9 +28,40 @@ extern "C" {
 }
 
 /* =========================================================================
- * Test 1: manual register_node
+ * Test 1: 手动注册节点
+ *
+ * 测试目标: 验证 treelock_register_node() 的基本功能 —
+ *          注册根节点和子节点、重复 ID 拒绝、父节点查询。
+ *
+ * 运行路径:
+ *   treelock_register_node(tl, 1, 0, "/")
+ *     → tree_api.c: 懒初始化 tree_index (tree_index_init)
+ *     → tree_core.c: tree_node_create(1, 0, "/") → 分配节点 + strdup label
+ *     → tree_core.c: tree_index_insert(idx, node) → hash 查重 → 头插链
+ *     → parent_id=0 (TREE_ROOT_PARENT) → idx->root_id = 1
+ *
+ *   treelock_register_node(tl, 2, 1, "home")
+ *     → tree_node_create(2, 1, "home")
+ *     → tree_index_insert → 插入 hash 表
+ *     → tree_core.c: tree_index_find(idx, 1) → 找到父节点
+ *     → tree_core.c: tree_node_add_child(parent, child) → children[] 数组扩展
+ *
+ *   treelock_register_node(tl, 1, 2, "dup") → 重复 ID
+ *     → tree_index_insert → tree_index_find() 查重命中 → LOG + return ERR_INVAL
+ *
+ *   treelock_get_parent(tl, 1, &parent_id)
+ *     → tree_api.c: tree_index_find(idx, 1) → node->parent_id=0
+ *
+ * 验证: register 成功返回 OK，重复 ID 返回 ERR_INVAL，parent 查询正确
  * ========================================================================= */
 
+/**
+ * 测试目标: 手动注册根节点+子节点，验证重复 ID 拒绝和父节点查询
+ *
+ * 运行路径: 参见上方 "Test 1" 块注释
+ * 覆盖: tree_api.c treelock_register_node(), treelock_get_parent(),
+ *       tree_core.c tree_node_create(), tree_index_insert(), tree_node_add_child()
+ */
 TEST(TreeTest, ManualRegisterNode)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -54,9 +90,44 @@ TEST(TreeTest, ManualRegisterNode)
 }
 
 /* =========================================================================
- * Test 2: load flat JSON
+ * Test 2: 加载扁平格式 JSON
+ *
+ * 测试目标: 验证从扁平 JSON ({ "nodes": [...] }) 加载树结构，并正确
+ *          建立节点关系和 path lookup 功能。
+ *
+ * 运行路径:
+ *   treelock_load_tree_from_string(tl, json)
+ *     → tree_api.c: 分配 tree_index → tree_index_init()
+ *     → tree_json.c: treelock_load_tree_from_string_internal()
+ *       → cJSON_Parse(json) → 解析 JSON 为 cJSON 树
+ *       → _parse_tree_json() 检测 "nodes" 键 → 扁平格式
+ *         → _parse_flat_nodes() 遍历数组:
+ *             每项: _json_get_uint64("id"), _json_get_uint64("parent"),
+ *                   _json_get_string("label") → parse_ctx_add_node()
+ *         → 转换 parse_ctx[] → treelock_tree_node_t[] (tree_node_create)
+ *       → tree_validate.c: treelock_validate_tree_structure()
+ *         扫描: ID 非零/唯一, parent 有效性, 单根, 无环
+ *       → tree_core.c: tree_index_insert() × N 逐个注册
+ *       → 第二轮遍历: tree_node_add_child() 建立父子关系
+ *     → 设置 tl->tree_data = idx, tl->tree_get_parent = _tree_get_parent_cb
+ *
+ *   treelock_lookup_path(tl, "/root/a/c", &node_id)
+ *     → tree_api.c → tree_path.c: treelock_resolve_path()
+ *       → 从 root_id 开始, 逐段解析: "/" → skip, "root" → match root.label,
+ *         "a" → tree_index_find_child_by_label(root, "a"),
+ *         "c" → tree_index_find_child_by_label(a, "c")
+ *       → 返回 path_ids[], path_len, 取最后一项 = node_id
+ *
+ * 验证: 4 节点树结构正确，path lookup 返回正确 node_id
  * ========================================================================= */
 
+/**
+ * 测试目标: 扁平 JSON 加载 + 结构查询 + path lookup
+ *
+ * 运行路径: 参见上方 "Test 2" 块注释
+ * 覆盖: tree_json.c _parse_flat_nodes(), tree_validate.c (校验通过路径),
+ *       tree_core.c 批量注册 + 建立父子关系, tree_path.c treelock_resolve_path()
+ */
 TEST(TreeTest, FlatJson)
 {
     const char *json =
@@ -98,9 +169,28 @@ TEST(TreeTest, FlatJson)
 }
 
 /* =========================================================================
- * Test 3: nested JSON
+ * Test 3: 加载嵌套格式 JSON
+ *
+ * 测试目标: 验证递归解析嵌套格式 JSON ({ "tree": {...} }) 的正确性。
+ *
+ * 运行路径:
+ *   _parse_tree_json() 检测 "tree" 键 → 嵌套格式
+ *     → _parse_nested_tree(json_root, TREE_ROOT_PARENT, depth=0)
+ *       递归处理:
+ *         parse_ctx_add_node(node_id, parent_id, label)
+ *         cJSON_ArrayForEach(children) → _parse_nested_tree(child, node_id, depth+1)
+ *       深度限制: TREE_MAX_DEPTH (256)
+ *     后续校验 + 注册路径同 FlatJson
+ *
+ * 验证: 嵌套 3 层树正确加载，path lookup 返回叶子节点
  * ========================================================================= */
 
+/**
+ * 测试目标: 嵌套 JSON 递归解析 + path lookup
+ *
+ * 运行路径: 参见上方 "Test 3" 块注释
+ * 覆盖: tree_json.c _parse_nested_tree() (递归), _parse_tree_json() 格式检测
+ */
 TEST(TreeTest, NestedJson)
 {
     const char *json =
@@ -137,9 +227,26 @@ TEST(TreeTest, NestedJson)
 }
 
 /* =========================================================================
- * Test 4: validation — duplicate ID
+ * Test 4: 校验 — 重复 ID
+ *
+ * 测试目标: 验证树校验阶段正确检测重复的 node_id。
+ *
+ * 运行路径:
+ *   treelock_validate_tree_structure(nodes, 2, idx)
+ *     → tree_validate.c: 第一遍扫描
+ *       → validate_set_insert(id_set, 1) → OK
+ *       → validate_set_insert(id_set, 1) → validate_set_contains() → TRUE
+ *         → TREELOCK_LOG_ERROR "duplicate node_id=1" → return ERR_INVAL
+ *
+ * 覆盖: tree_validate.c validate_set_insert() 查重逻辑
  * ========================================================================= */
 
+/**
+ * 测试目标: 重复 node_id 被校验拒绝
+ *
+ * 运行路径: 参见上方 "Test 4" 块注释
+ * 覆盖: tree_validate.c — ID 唯一性检查路径
+ */
 TEST(TreeTest, ValidateDuplicateId)
 {
     const char *json =
@@ -155,9 +262,26 @@ TEST(TreeTest, ValidateDuplicateId)
 }
 
 /* =========================================================================
- * Test 5: validation — multi root
+ * Test 5: 校验 — 多根节点
+ *
+ * 测试目标: 验证树校验拒绝多个根节点 (parent=0 的节点 > 1)。
+ *
+ * 运行路径:
+ *   treelock_validate_tree_structure(nodes, 2, idx)
+ *     → 第一遍扫描:
+ *       nodes[0]: parent=0 → root_count++ (1), root_id=1
+ *       nodes[1]: parent=0 → root_count++ (2), root_id=2
+ *     → root_count > 1 → "multiple root nodes (2)" → return ERR_INVAL
+ *
+ * 覆盖: tree_validate.c 根节点计数检查
  * ========================================================================= */
 
+/**
+ * 测试目标: 多个根节点被校验拒绝
+ *
+ * 运行路径: 参见上方 "Test 5" 块注释
+ * 覆盖: tree_validate.c — root_count > 1 分支
+ */
 TEST(TreeTest, ValidateMultiRoot)
 {
     const char *json =
@@ -173,9 +297,29 @@ TEST(TreeTest, ValidateMultiRoot)
 }
 
 /* =========================================================================
- * Test 6: validation — cycle
+ * Test 6: 校验 — 环路检测
+ *
+ * 测试目标: 验证校验阶段检测到环 A(1)→B(2)→C(3)→A(1)
+ *
+ * 运行路径:
+ *   treelock_validate_tree_structure(nodes, 3, idx)
+ *     → 第一遍 + 第二遍扫描通过 (ID 唯一, parent 有效, 单根)
+ *     → 环路检测:
+ *       node[0] (id=1, parent=3):
+ *         追溯: current=3 → 查 nodes[] → nodes[2].parent → current=2
+ *               → 查 nodes[] → nodes[1].parent → current=1
+ *               → current==node[0].node_id → 检测到环
+ *               → "cycle detected at node_id=1" → return ERR_INVAL
+ *
+ * 覆盖: tree_validate.c 环路检测算法 (向上追溯 + 自引用检测)
  * ========================================================================= */
 
+/**
+ * 测试目标: 环路被校验检测到
+ *
+ * 运行路径: 参见上方 "Test 6" 块注释
+ * 覆盖: tree_validate.c — 环路检测 (向上追溯 + 步数限制)
+ */
 TEST(TreeTest, ValidateCycle)
 {
     /* A(1) → B(2) → C(3) → A(1) */
@@ -193,9 +337,37 @@ TEST(TreeTest, ValidateCycle)
 }
 
 /* =========================================================================
- * Test 7: protocol auto-enforcement
+ * Test 7: 协议自动强制
+ *
+ * 测试目标: 验证树加载后 lock 时自动检查父节点意向锁规则。
+ *
+ * 运行路径:
+ *   树: root(1) → child(2)
+ *
+ *   treelock_lock(tl, 2, S) — 无父锁 → 拒绝
+ *     → _do_lock_core() → treelock_validate_protocol(tl, 2, S)
+ *       → tree_get_parent(tl->tree_data, 2) → parent_id=1
+ *       → treelock_required_parent_mode(S) → TREELOCK_IS
+ *       → treelock_get_mode(tl, 1) → TREELOCK_NL
+ *       → required=IS, held=NL → LOG WARN + return ERR_PROTOCOL
+ *
+ *   treelock_lock(tl, 1, IS) → treelock_lock(tl, 2, S) — 正确顺序 → 成功
+ *     → 先锁根: _do_lock_core() → validate → parent=0 (根) → OK
+ *     → 再锁子: validate → parent=1, held=IS, required=IS → OK
+ *
+ *   treelock_lock(tl, 2, X) — 父只有 IS 不够 → 拒绝
+ *     → required_parent_mode(X) → IX
+ *     → held(1)=IS, required=IX → IS∉{IX,SIX,X} → ERR_PROTOCOL
+ *
+ * 覆盖: protocol.c treelock_validate_protocol() 两条规则分支
  * ========================================================================= */
 
+/**
+ * 测试目标: lock 时自动检查祖先节点意向锁
+ *
+ * 运行路径: 参见上方 "Test 7" 块注释
+ * 覆盖: protocol.c treelock_validate_protocol() — IS 分支 + IX 分支
+ */
 TEST(TreeTest, ProtocolEnforcement)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -227,9 +399,42 @@ TEST(TreeTest, ProtocolEnforcement)
 }
 
 /* =========================================================================
- * Test 8: lock_path / unlock_path
+ * Test 8: lock_path / unlock_path 基本流程
+ *
+ * 测试目标: 验证 treelock_lock_path() 自顶向下加意向锁 +
+ *          treelock_unlock_path() 自底向上释放。
+ *
+ * 运行路径:
+ *   树: / (1) → home (2) → alice (3)
+ *
+ *   treelock_lock_path(tl, "/home/alice", X)
+ *     → tree_api.c: treelock_lock_path()
+ *       → treelock_resolve_path() → path_ids=[1,2,3], path_len=3
+ *       → treelock_ancestor_mode_for(X) → IX
+ *       → for i=0: treelock_lock(tl, 1, IX) → _do_lock_core() → grant IX on /1
+ *       → for i=1: treelock_lock(tl, 2, IX)
+ *           → validate: parent=1, held=IX, required=IX → OK
+ *           → grant IX on /2
+ *       → for i=2: treelock_lock(tl, 3, X)
+ *           → validate: parent=2, held=IX, required=IX → OK
+ *           → grant X on /3
+ *
+ *   treelock_unlock_path(tl, "/home/alice")
+ *     → tree_api.c: treelock_unlock_path()
+ *       → treelock_resolve_path() → path_ids=[1,2,3], path_len=3
+ *       → for i=2→0: treelock_unlock(tl, path_ids[i])
+ *         → 逆序: 3→2→1 (自底向上)
+ *
+ * 验证: 祖先节点模式 IX/IX/X, 释放后全部 NL
  * ========================================================================= */
 
+/**
+ * 测试目标: lock_path X 模式 → 祖先 IX, unlock_path 逆序释放
+ *
+ * 运行路径: 参见上方 "Test 8" 块注释
+ * 覆盖: tree_api.c treelock_lock_path() + treelock_unlock_path(),
+ *       tree_path.c treelock_resolve_path(), treelock_ancestor_mode_for()
+ */
 TEST(TreeTest, LockPathAndUnlockPath)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -260,9 +465,26 @@ TEST(TreeTest, LockPathAndUnlockPath)
 }
 
 /* =========================================================================
- * Test 9: backward compatibility (no tree)
+ * Test 9: 向后兼容 (无树可加锁)
+ *
+ * 测试目标: 验证未加载树时 lock 操作不受协议校验限制 (向后兼容 Phase 1)。
+ *
+ * 运行路径:
+ *   treelock_tree_loaded(tl) → tree_data==NULL → return FALSE
+ *   treelock_lock(tl, 999, X)
+ *     → _do_lock_core() → treelock_validate_protocol()
+ *       → tree_data==NULL → return TREELOCK_OK (跳过校验)
+ *       → 正常 grant X on 999
+ *
+ * 覆盖: protocol.c treelock_validate_protocol() — tree_data==NULL 快速返回
  * ========================================================================= */
 
+/**
+ * 测试目标: 无树时 lock 任意节点不触发协议校验
+ *
+ * 运行路径: 参见上方 "Test 9" 块注释
+ * 覆盖: protocol.c treelock_validate_protocol() NULL 守卫
+ */
 TEST(TreeTest, BackwardCompatibility)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -279,8 +501,44 @@ TEST(TreeTest, BackwardCompatibility)
 
 /* =========================================================================
  * Test 10: register_node 边界条件
+ *
+ * 测试目标: 验证 treelock_register_node() 的各类错误处理 —
+ *          ID=0、根重复、父不存在、ID 重复。
+ *
+ * 运行路径:
+ *   register_node(tl, 0, 0, null) — ID=0
+ *     → tree_api.c: node_id==0 → return ERR_INVAL (不进入创建)
+ *
+ *   register_node(tl, 1, 0, "/") — 正常根节点
+ *     → 懒初始化 + tree_node_create + tree_index_insert
+ *     → parent=0 → idx->root_id=1
+ *
+ *   register_node(tl, 2, 0, "root2") — 根重复
+ *     → tree_node_create(2,0,"root2") → tree_index_insert(OK)
+ *     → parent=0 → idx->root_id != 0 (已有 root=1)
+ *       → LOG "root already exists" → return ERR_INVAL
+ *
+ *   register_node(tl, 10, 99, "orphan") — 父不存在
+ *     → tree_node_create + tree_index_insert
+ *     → parent=99 → tree_index_find(idx, 99) → NULL
+ *       → return ERR_INVAL
+ *
+ *   register_node(tl, 3, 1, "child") — 正常子节点
+ *     → 父存在 + tree_node_add_child
+ *
+ *   register_node(tl, 1, 3, "dup") — 重复 ID
+ *     → tree_index_insert → tree_index_find(1)!=NULL → ERR_INVAL
+ *
+ * 覆盖: tree_api.c treelock_register_node() 全部错误分支
  * ========================================================================= */
 
+/**
+ * 测试目标: register_node 全部错误处理边界
+ *
+ * 运行路径: 参见上方 "Test 10" 块注释
+ * 覆盖: tree_api.c — ID=0 检查, 根重复检查, 父不存在检查,
+ *       tree_core.c tree_index_insert 查重
+ */
 TEST(TreeTest, RegisterNodeEdgeCases)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -308,9 +566,42 @@ TEST(TreeTest, RegisterNodeEdgeCases)
 }
 
 /* =========================================================================
- * Test 11: 非法 JSON
+ * Test 11: 非法 JSON 输入
+ *
+ * 测试目标: 验证各种非法 JSON 输入被正确拒绝，不崩溃。
+ *
+ * 运行路径:
+ *   InvalidJsonSyntax:
+ *     "123": cJSON_Parse → number (非 object) → ERR_INVAL
+ *     "\"tree\":{}": cJSON_Parse → 合法 JSON 但 root 非 object → ERR_INVAL
+ *     "{}": cJSON_Parse → object 但无 "tree"/"nodes" → LOG + ERR_INVAL
+ *     "": cJSON_Parse → NULL → ERR_INVAL
+ *     nullptr: tl==null 或 json==null → ERR_INVAL (早期返回)
+ *
+ *   InvalidJsonEmptyNodes:
+ *     "{\"nodes\":[]}": 解析成功但 node_count=0
+ *       → validate: "empty node list" → ERR_INVAL
+ *
+ *   InvalidJsonMissingId:
+ *     "{\"nodes\":[{\"parent\":0}]}": id 字段缺失
+ *       → _parse_flat_nodes: cJSON_GetObjectItem("id") → NULL
+ *         → LOG "missing 'id' field" → ERR_INVAL
+ *
+ *   InvalidJsonSelfParent:
+ *     "{\"nodes\":[{\"id\":1,\"parent\":1}]}": parent==id
+ *       → 校验第一遍 OK, 第二遍 OK, 根检查: node_count=1, parent=0? NO, parent=1
+ *         → root_count=0 → "no root node found" → ERR_INVAL
+ *       或: 环路检测 → current=1 == node_id=1 → cycle detected
+ *
+ * 覆盖: tree_json.c 各种错误返回, tree_validate.c 空列表/无根/自引用
  * ========================================================================= */
 
+/**
+ * 测试目标: 非法 JSON 语法被拒绝 (5 种格式)
+ *
+ * 运行路径: 参见上方 "Test 11" 块注释 — InvalidJsonSyntax
+ * 覆盖: tree_json.c cJSON_Parse 错误处理
+ */
 TEST(TreeTest, InvalidJsonSyntax)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -334,6 +625,12 @@ TEST(TreeTest, InvalidJsonSyntax)
     treelock_destroy(tl);
 }
 
+/**
+ * 测试目标: 空节点数组被校验拒绝
+ *
+ * 运行路径: treelock_validate_tree_structure() count==0 → "empty node list"
+ * 覆盖: tree_validate.c — count==0 早期返回
+ */
 TEST(TreeTest, InvalidJsonEmptyNodes)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -345,6 +642,12 @@ TEST(TreeTest, InvalidJsonEmptyNodes)
     treelock_destroy(tl);
 }
 
+/**
+ * 测试目标: 节点缺少 id 字段被拒绝
+ *
+ * 运行路径: _parse_flat_nodes() — cJSON_GetObjectItem("id")==NULL → ERR_INVAL
+ * 覆盖: tree_json.c — flat 格式 id 必须检查
+ */
 TEST(TreeTest, InvalidJsonMissingId)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -357,6 +660,13 @@ TEST(TreeTest, InvalidJsonMissingId)
     treelock_destroy(tl);
 }
 
+/**
+ * 测试目标: 自引用 parent==id 被检测
+ *
+ * 运行路径: 校验阶段 root_count=0 (parent=1≠0) → "no root" → ERR_INVAL
+ *          或环路检测 → current(1)==node_id(1) → cycle detected
+ * 覆盖: tree_validate.c 根检查或环路检测
+ */
 TEST(TreeTest, InvalidJsonSelfParent)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -371,8 +681,30 @@ TEST(TreeTest, InvalidJsonSelfParent)
 
 /* =========================================================================
  * Test 12: 树重加载
+ *
+ * 测试目标: 验证加载新树时自动清除旧树结构（不泄漏内存），
+ *          旧路径失效 + 新路径生效。
+ *
+ * 运行路径:
+ *   treelock_load_tree_from_string(tl, tree1) → 加载成功, tree_data=idx1
+ *   treelock_load_tree_from_string(tl, tree2)
+ *     → tree_api.c: tree_data!=NULL → tree_index_destroy(idx1) + free(idx1)
+ *     → 分配新 idx → 解析 + 校验 + 注册 tree2
+ *     → tree_data=idx2
+ *
+ *   treelock_lookup_path(tl, "/root/a") → 解析失败 (tree1 已销毁)
+ *   treelock_lookup_path(tl, "/newroot/b") → 解析成功 (tree2 有效)
+ *
+ * 覆盖: tree_api.c treelock_load_tree_from_string() 重加载分支,
+ *       tree_core.c tree_index_destroy() 递归释放
  * ========================================================================= */
 
+/**
+ * 测试目标: 加载新树覆盖旧树，旧路径失效 + 新路径生效
+ *
+ * 运行路径: 参见上方 "Test 12" 块注释
+ * 覆盖: tree_api.c — tree_data 非空时 tree_index_destroy + free
+ */
 TEST(TreeTest, ReloadTree)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -411,9 +743,29 @@ TEST(TreeTest, ReloadTree)
 }
 
 /* =========================================================================
- * Test 13: lock_path — IS/S 目标模式
+ * Test 13: lock_path IS 目标模式
+ *
+ * 测试目标: 验证 lock_path 以 S 为目标时，祖先节点使用 IS (而非 IX)。
+ *
+ * 运行路径:
+ *   treelock_lock_path(tl, "/home/data", S)
+ *     → treelock_ancestor_mode_for(S) → TREELOCK_IS
+ *     → for i=0: treelock_lock(tl, 1, IS) → grant IS on root
+ *     → for i=1: treelock_lock(tl, 2, IS) → grant IS on /home
+ *     → for i=2: treelock_lock(tl, 3, S)  → grant S on /home/data
+ *
+ * 对比: lock_path X 模式 → ancestor_mode=IX (Test 8 已验证)
+ *
+ * 覆盖: tree_path.c treelock_ancestor_mode_for() IS 分支,
+ *       tree_api.c treelock_lock_path() 祖先模式应用
  * ========================================================================= */
 
+/**
+ * 测试目标: lock_path S 模式 → 祖先用 IS (非 IX)
+ *
+ * 运行路径: 参见上方 "Test 13" 块注释
+ * 覆盖: tree_path.c treelock_ancestor_mode_for() IS/S case
+ */
 TEST(TreeTest, LockPathISMode)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -446,8 +798,42 @@ TEST(TreeTest, LockPathISMode)
 
 /* =========================================================================
  * Test 14: lock_path / unlock_path 边界
+ *
+ * 测试目标: 验证 lock_path / unlock_path 的各类边界和错误处理。
+ *
+ * 运行路径:
+ *   LockPathInvalidPath:
+ *     lock_path(tl, "/test", S) — 树未加载
+ *       → tree_data==NULL → LOG + ERR_INVAL
+ *     lock_path(tl, "", S) — 空路径
+ *       → treelock_resolve_path() 中 path[0]=='\0' → "empty path" → ERR_INVAL
+ *     lock_path(tl, nullptr, S) — NULL
+ *       → tl==null || path==null → ERR_INVAL (早期)
+ *     lock_path(tl, "/nonexist", S) — 不存在
+ *       → resolve: tree_index_find_child_by_label(root, "nonexist") → NULL → ERR_INVAL
+ *     lock_path(tl, "/dir", NL) — 非法 mode
+ *       → mode <= NL || mode > MAX → ERR_INVAL
+ *
+ *   UnlockPathEdgeCases:
+ *     unlock_path(tl, "/") — 未持有锁
+ *       → resolve OK → for i: treelock_unlock → held==NULL → ERR_INVAL
+ *       → 返回第一个错误
+ *
+ *   LockPathRootOnly:
+ *     lock_path(tl, "/", X) — 仅根
+ *       → resolve → path_ids=[1], path_len=1
+ *       → i=0 (唯一): lock(1, X) → grant X on root
+ *
+ * 覆盖: tree_api.c + tree_path.c 全部错误处理分支
  * ========================================================================= */
 
+/**
+ * 测试目标: lock_path 各类无效输入被拒绝
+ *
+ * 运行路径: 参见上方 "Test 14" LockPathInvalidPath 路径
+ * 覆盖: tree_api.c — 树未加载/空路径/NULL/模式非法,
+ *       tree_path.c — 路径段不存在
+ */
 TEST(TreeTest, LockPathInvalidPath)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -479,6 +865,12 @@ TEST(TreeTest, LockPathInvalidPath)
     treelock_destroy(tl);
 }
 
+/**
+ * 测试目标: unlock_path 边界条件
+ *
+ * 运行路径: 参见上方 "Test 14" UnlockPathEdgeCases 路径
+ * 覆盖: tree_api.c treelock_unlock_path() — 树未加载/空路径/未持有锁
+ */
 TEST(TreeTest, UnlockPathEdgeCases)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -503,6 +895,12 @@ TEST(TreeTest, UnlockPathEdgeCases)
     treelock_destroy(tl);
 }
 
+/**
+ * 测试目标: lock_path("/") 仅锁根节点
+ *
+ * 运行路径: 参见上方 "Test 14" LockPathRootOnly 路径
+ * 覆盖: tree_path.c — path_len==1 (skip root label → done)
+ */
 TEST(TreeTest, LockPathRootOnly)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -523,13 +921,34 @@ TEST(TreeTest, LockPathRootOnly)
 
 /* =========================================================================
  * Test 15: ancestor_mode_for 全模式
+ *
+ * 测试目标: 验证 treelock_ancestor_mode_for() 对所有 6 种锁模式
+ *          返回正确的祖先锁模式。
+ *
+ * 运行路径:
+ *   treelock_ancestor_mode_for(mode)
+ *     → tree_path.c: switch(mode)
+ *       IS/S    → TREELOCK_IS  (共享类 → 父需意向共享)
+ *       IX/SIX/X → TREELOCK_IX (排他类 → 父需意向排他)
+ *       default → TREELOCK_NL  (NL/非法 → 不需要父锁)
+ *
+ * 此函数是 treelock_lock_path() 祖先模式推导的核心。
+ * 覆盖: tree_path.c treelock_ancestor_mode_for() 全部 switch 分支
  * ========================================================================= */
 
-/* treelock_ancestor_mode_for 声明（内部函数，手动声明避免引入 tree_internal.h 的 cJSON 依赖） */
+/*
+ * treelock_ancestor_mode_for 声明（内部函数，手动声明避免引入 tree_internal.h 的 cJSON 依赖）
+ */
 extern "C" {
 treelock_mode_t treelock_ancestor_mode_for(treelock_mode_t child_mode);
 }
 
+/**
+ * 测试目标: 全 6 种模式 + 非法值的祖先模式推导
+ *
+ * 运行路径: 参见上方 "Test 15" 块注释
+ * 覆盖: tree_path.c treelock_ancestor_mode_for() — IS/S/IX/SIX/X/NL/default
+ */
 TEST(TreeTest, AncestorModeForAllModes)
 {
     /* IS / S → 祖先用 IS */
@@ -550,8 +969,29 @@ TEST(TreeTest, AncestorModeForAllModes)
 
 /* =========================================================================
  * Test 16: lookup_path 边界
+ *
+ * 测试目标: 验证 treelock_lookup_path() 的边界处理 —
+ *          树未加载、NULL 参数、根路径。
+ *
+ * 运行路径:
+ *   lookup_path(tl, "/test", &id) — 树未加载
+ *     → tree_data==NULL → ERR_INVAL
+ *   lookup_path(tl, nullptr, &id) — NULL path
+ *     → path==NULL → ERR_INVAL
+ *   lookup_path(tl, "/root", nullptr) — NULL output
+ *     → node_id==NULL → ERR_INVAL
+ *   lookup_path(tl, "/root", &id)
+ *     → resolve → path_ids=[1], path_len=1 → id=path_ids[0]
+ *
+ * 覆盖: tree_api.c treelock_lookup_path() 守卫检查
  * ========================================================================= */
 
+/**
+ * 测试目标: lookup_path 各种边界条件
+ *
+ * 运行路径: 参见上方 "Test 16" 块注释
+ * 覆盖: tree_api.c treelock_lookup_path() — NULL 守卫 + 正常路径
+ */
 TEST(TreeTest, LookupPathEdgeCases)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -580,8 +1020,25 @@ TEST(TreeTest, LookupPathEdgeCases)
 
 /* =========================================================================
  * Test 17: get_parent 边界
+ *
+ * 测试目标: 验证 treelock_get_parent() 的 NULL 安全、树未加载、
+ *          不存在节点、根节点返回 0。
+ *
+ * 运行路径:
+ *   get_parent(tl, 1, nullptr) → parent_id==NULL → ERR_INVAL
+ *   get_parent(tl, 1, &pid) — 树未加载 → tree_data==NULL → ERR_INVAL
+ *   get_parent(tl, 999, &pid) → tree_index_find(999) → NULL → ERR_INVAL
+ *   get_parent(tl, 1, &pid) → node->parent_id → 0 (TREE_ROOT_PARENT)
+ *
+ * 覆盖: tree_api.c treelock_get_parent() 全部错误处理
  * ========================================================================= */
 
+/**
+ * 测试目标: get_parent 各种边界条件
+ *
+ * 运行路径: 参见上方 "Test 17" 块注释
+ * 覆盖: tree_api.c treelock_get_parent() — NULL/未加载/不存在/根
+ */
 TEST(TreeTest, GetParentEdgeCases)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -609,8 +1066,27 @@ TEST(TreeTest, GetParentEdgeCases)
 
 /* =========================================================================
  * Test 18: 单节点树 (仅根节点)
+ *
+ * 测试目标: 验证仅有一个根节点的树可以正常 lock/unlock，
+ *          协议校验对根节点放行。
+ *
+ * 运行路径:
+ *   register_node(tl, 1, 0, "/") → root_id=1
+ *   treelock_lock(tl, 1, X)
+ *     → _do_lock_core() → validate_protocol(tl, 1, X)
+ *       → tree_get_parent(idx, 1) → TREE_ROOT_PARENT (0)
+ *       → parent_id==0 → return OK (根节点不需要父锁)
+ *     → grant X on node 1
+ *
+ * 覆盖: protocol.c treelock_validate_protocol() 根节点分支
  * ========================================================================= */
 
+/**
+ * 测试目标: 单节点树 lock 根节点通过协议校验
+ *
+ * 运行路径: 参见上方 "Test 18" 块注释
+ * 覆盖: protocol.c — parent_id==0 根节点快速返回
+ */
 TEST(TreeTest, SingleNodeTree)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -634,8 +1110,23 @@ TEST(TreeTest, SingleNodeTree)
 
 /* =========================================================================
  * Test 19: destroy 后 tree_loaded 检查
+ *
+ * 测试目标: 验证 treelock_tree_loaded(nullptr) 安全返回 FALSE。
+ *
+ * 运行路径:
+ *   treelock_destroy(tl) → tree_data=NULL, tree_get_parent=NULL, free
+ *   treelock_tree_loaded(nullptr)
+ *     → tl==NULL → return FALSE (不访问成员)
+ *
+ * 覆盖: tree_api.c treelock_tree_loaded() NULL 守卫
  * ========================================================================= */
 
+/**
+ * 测试目标: destroy 后 tree_loaded(nullptr) 安全返回
+ *
+ * 运行路径: 参见上方 "Test 19" 块注释
+ * 覆盖: tree_api.c treelock_tree_loaded() — tl==NULL 分支
+ */
 TEST(TreeTest, TreeNotLoadedAfterDestroy)
 {
     treelock_t *tl = treelock_create(nullptr);

@@ -1,7 +1,12 @@
 /*
  * TreeLocks — 并发压力测试 (GTest)
  *
- * 测试多线程环境下的锁操作正确性，验证互斥和死锁防护。
+ * 测试多线程环境下的锁操作正确性，验证互斥、重入、升降级和查询功能。
+ * 被测源文件: modules/treelock_core/src/client.c, lock_table.c
+ *
+ * Phase 1 注意: 每个 treelock_t 有独立锁表，跨实例无真正锁竞争。
+ * 跨客户端竞争需 Phase 2+ server 模式。本文件测试单实例多线程、
+ * 重入锁、升降级等 Phase 1 可验证的行为。
  *
  * 版本: 0.2.0
  * 日期: 2026-06-13
@@ -30,7 +35,28 @@ extern "C" {
 #define CLIENT_ID_MAX     (32)
 
 /* =========================================================================
- * Test 1: multi-client concurrent lock/unlock
+ * Test 1: 多客户端并发 lock/unlock
+ *
+ * 测试目标: 多个独立的 treelock_t 实例在并发执行 lock/try_lock/unlock
+ *          时不出现死锁、崩溃或数据损坏。
+ *
+ * 运行路径:
+ *   每个线程:
+ *     treelock_create() → 创建独立锁表 + mutex 初始化
+ *     for 1000 ops:
+ *       treelock_try_lock(tl, node, IS/IX/X, timeout=100ms)
+ *         → client.c: _do_lock_core()
+ *           → lock_table.c: treelock_table_get_or_create()  (节点不存在则创建)
+ *           → lock_table.c: treelock_table_check_conflict() (自身不冲突→直接授予)
+ *           → lock_table.c: treelock_table_grant_lock()     (加入 grant 列表)
+ *         → client.c: _add_held_lock() (记录到 held_locks[])
+ *       treelock_unlock(tl, node)
+ *         → client.c: _find_held_lock() → ref_count ≤ 1 → 释放
+ *           → lock_table.c: treelock_table_release_lock()
+ *           → lock_table.c: treelock_table_wake_waiters()
+ *     treelock_destroy() → 释放所有锁 + 清理锁表
+ *
+ * 验证: 8 线程 × 1000 ops = 8000 次操作全部无 TREELOCK_ERR_* 错误
  * ========================================================================= */
 
 typedef struct {
@@ -75,6 +101,12 @@ static void *basic_worker(void *arg) {
     return nullptr;
 }
 
+/**
+ * 测试目标: 8 线程并发执行 lock/unlock 无错误
+ *
+ * 运行路径: 参见上方 "Test 1" 块注释
+ * 覆盖: client.c (全程), lock_table.c (全程)
+ */
 TEST(Concurrent, MultiClientLockUnlock)
 {
     pthread_t threads[NUM_THREADS];
@@ -98,7 +130,26 @@ TEST(Concurrent, MultiClientLockUnlock)
 }
 
 /* =========================================================================
- * Test 2: lock table consistency (shared instance)
+ * Test 2: 共享实例锁表一致性
+ *
+ * 测试目标: 多个线程共享同一 treelock_t 实例，每个线程使用不同的 node_id
+ *          范围，验证共享锁表在并发创建节点、授予锁、释放锁时不出现
+ *          数据竞争或状态不一致。
+ *
+ * 运行路径:
+ *   所有线程共享 tl (同一个锁表):
+ *     treelock_try_lock(tl, tid*1000 + i, IX, 200ms)
+ *       → lock_table.c: treelock_table_get_or_create()  (table_mutex 保护)
+ *         → 链表头插入新节点
+ *       → lock_table.c: treelock_table_check_conflict()  (同 client_id 自身跳过)
+ *       → lock_table.c: treelock_table_grant_lock()     (grant 数组扩展)
+ *       → client.c: _add_held_lock()                    (held_mutex 保护)
+ *     treelock_unlock(tl, node)
+ *       → lock_table.c: treelock_table_release_lock()   (swap-remove)
+ *       → lock_table.c: treelock_table_wake_waiters()
+ *   最后 treelock_destroy(tl) 清理所有节点
+ *
+ * 验证: 0 unlock 错误
  * ========================================================================= */
 
 static volatile int g_lock_count   = 0;
@@ -126,6 +177,12 @@ static void *consistency_worker(void *arg) {
     return nullptr;
 }
 
+/**
+ * 测试目标: 共享 treelock_t 的并发 lock/unlock 一致性
+ *
+ * 运行路径: 参见上方 "Test 2" 块注释
+ * 覆盖: lock_table.c table_mutex 并发保护, client.c held_mutex 并发保护
+ */
 TEST(Concurrent, SharedInstanceConsistency)
 {
     treelock_config_t cfg;
@@ -156,9 +213,39 @@ TEST(Concurrent, SharedInstanceConsistency)
 }
 
 /* =========================================================================
- * Test 3: try_lock timeout
+ * Test 3: try_lock 超时与立即获取
+ *
+ * 测试目标: 验证 try_lock 在锁可用时立即返回成功（耗时远小于超时值），
+ *          以及同客户端重入锁不阻塞。
+ *
+ * 运行路径:
+ *   Phase 1 中每个 treelock_t 有独立锁表，不同实例间不存在真正冲突。
+ *   此处测试 Phase 1 可验证的行为:
+ *
+ *   场景 1 — 锁可用时:
+ *     treelock_try_lock(tl, 100, X, 50ms)
+ *       → _do_lock_core()
+ *         → _get_held_mode() → 未持有 → 跳过重入检查
+ *         → treelock_table_get_or_create() → 新建节点 (grant_count=0)
+ *         → treelock_table_check_conflict() → grant_count=0 → return TRUE (无冲突)
+ *         → treelock_table_grant_lock() → 直接授予
+ *         → _add_held_lock()
+ *
+ *   场景 2 — 同客户端重入:
+ *     treelock_try_lock(tl, 100, X, 200ms)  (已有 X 锁)
+ *       → _do_lock_core()
+ *         → _get_held_mode() → TREELOCK_OK, existing_mode = X == mode → ref_count++
+ *         → 直接返回 TREELOCK_OK (不进入锁表操作)
+ *
+ * 验证: 两次操作都在 50ms 内完成（远小于超时值），模式正确。
  * ========================================================================= */
 
+/**
+ * 测试目标: try_lock 在锁可用时立即返回 + 重入锁快速路径
+ *
+ * 运行路径: 参见上方 "Test 3" 块注释
+ * 覆盖: client.c _do_lock_core() — 快速授予路径 + 重入 ref_count 路径
+ */
 TEST(Concurrent, TryLockTimeout)
 {
     /*
@@ -201,9 +288,49 @@ TEST(Concurrent, TryLockTimeout)
 }
 
 /* =========================================================================
- * Test 4: re-entrant lock/unlock
+ * Test 4: 重入锁引用计数
+ *
+ * 测试目标: 验证同客户端同节点同模式的重复加锁通过引用计数 (ref_count)
+ *          正确管理，而非在锁表中创建重复 grant 记录。
+ *
+ * 运行路径:
+ *   ReentrantLock:
+ *     第 1 次 treelock_lock(tl, 1, S)
+ *       → _do_lock_core() → 新获取 → grant + held (ref_count=1)
+ *     第 2 次 treelock_lock(tl, 1, S)
+ *       → _do_lock_core() → _get_held_mode() → existing=S → mode 相同
+ *         → _find_held_lock() → ref_count++ (2)
+ *         → 不进入锁表操作
+ *     第 3 次同样 ref_count++ (3)
+ *     第 1 次 treelock_unlock(tl, 1)
+ *       → _find_held_lock() → ref_count > 1 → ref_count-- (2) → 不释放锁表
+ *     第 2 次: ref_count-- (1)
+ *     第 3 次: ref_count-- (1→0) → 从 held[] swap-remove
+ *       → treelock_table_release_lock()
+ *     第 4 次 treelock_unlock: _find_held_lock() → NULL → TREELOCK_ERR_INVAL
+ *
+ *   ReentrantLockUpgrade:
+ *     treelock_lock(tl, 2, IS) → held[mode=IS, ref_count=1]
+ *     treelock_escalate(tl, 2, S)
+ *       → client.c: treelock_escalate()
+ *         → _get_held_mode() → IS
+ *         → treelock_escalate_valid(IS, S) → TRUE
+ *         → treelock_table_grant_lock(S) + treelock_table_release_lock(IS)
+ *         → 原地更新 held: mode = S
+ *     treelock_lock(tl, 2, S) (re-entrant)
+ *       → 同 mode → ref_count++ (2)
+ *   释放路径同上。
+ *
+ * 验证: ref_count 正确计算，超额 unlock 返回错误
  * ========================================================================= */
 
+/**
+ * 测试目标: 同模式重入锁的引用计数管理
+ *
+ * 运行路径: 参见上方 "Test 4" 块注释 — ReentrantLock 路径
+ * 覆盖: client.c _do_lock_core() 重入分支, _find_held_lock(),
+ *       _remove_held_lock() ref_count > 1 路径
+ */
 TEST(Concurrent, ReentrantLock)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -231,6 +358,13 @@ TEST(Concurrent, ReentrantLock)
     treelock_destroy(tl);
 }
 
+/**
+ * 测试目标: escalate 后再重入锁的引用计数
+ *
+ * 运行路径: 参见上方 "Test 4" 块注释 — ReentrantLockUpgrade 路径
+ * 覆盖: client.c treelock_escalate() — grant 新旧模式 + held原地更新,
+ *       _do_lock_core() 重入分支在 upgrade 后的行为
+ */
 TEST(Concurrent, ReentrantLockUpgrade)
 {
     treelock_t *tl = treelock_create(nullptr);
@@ -255,7 +389,29 @@ TEST(Concurrent, ReentrantLockUpgrade)
 }
 
 /* =========================================================================
- * Test 5: concurrent lock escalate (original)
+ * Test 5: 并发锁升级
+ *
+ * 测试目标: 多个线程同时独立执行 IS→S 锁升级，验证 escalate 路径的
+ *          并发安全性（grant 替换 + held 更新 无竞争）。
+ *
+ * 运行路径:
+ *   每个线程 (独立 treelock_t, 5 个不同节点):
+ *     for 100 ops:
+ *       treelock_lock(tl, node, IS)
+ *         → _do_lock_core() → grant IS → held[IS]
+ *       treelock_escalate(tl, node, S)
+ *         → client.c: treelock_escalate()
+ *           → _get_held_mode() → IS
+ *           → treelock_escalate_valid(IS, S) → TRUE
+ *           → treelock_table_grant_lock(S)  → grant S
+ *           → treelock_table_release_lock(IS) → remove IS grant
+ *           → treelock_table_wake_waiters()
+ *           → held.mode = S (原地更新)
+ *       treelock_unlock(tl, node)
+ *         → _find_held_lock() → ref_count=1 → 释放
+ *           → treelock_table_release_lock(S)
+ *
+ * 验证: 4 线程 × 100 ops = 400 次 escalate 无错误
  * ========================================================================= */
 
 static void *escalate_worker(void *arg) {
@@ -285,6 +441,12 @@ static void *escalate_worker(void *arg) {
     return nullptr;
 }
 
+/**
+ * 测试目标: 4 线程并发执行 IS→S 升级无错误
+ *
+ * 运行路径: 参见上方 "Test 5" 块注释
+ * 覆盖: client.c treelock_escalate() — grant/release/wake 完整流程
+ */
 TEST(Concurrent, LockEscalate)
 {
     pthread_t threads[ESCALATE_THREADS];
@@ -304,7 +466,28 @@ TEST(Concurrent, LockEscalate)
 }
 
 /* =========================================================================
- * Test 6: concurrent lock downgrade
+ * Test 6: 并发锁降级
+ *
+ * 测试目标: 多个线程同时独立执行 X→IS 锁降级，验证降级路径的
+ *          并发安全性。
+ *
+ * 运行路径:
+ *   每个线程 (独立 treelock_t, 3 个不同节点):
+ *     for 100 ops:
+ *       treelock_lock(tl, node, X)
+ *         → _do_lock_core() → grant X → held[X]
+ *       treelock_downgrade(tl, node, IS)
+ *         → client.c: treelock_downgrade()
+ *           → _get_held_mode() → X
+ *           → treelock_downgrade_valid(X, IS) → TRUE
+ *           → treelock_table_grant_lock(IS) → grant IS
+ *           → treelock_table_release_lock(X) → remove X grant
+ *           → treelock_table_wake_waiters()
+ *           → held.mode = IS (原地更新)
+ *       treelock_unlock(tl, node)
+ *         → treelock_table_release_lock(IS)
+ *
+ * 验证: 4 线程 × 100 ops = 400 次降级无错误
  * ========================================================================= */
 
 #define DOWNGRADE_THREADS (4)
@@ -338,6 +521,12 @@ static void *downgrade_worker(void *arg) {
     return nullptr;
 }
 
+/**
+ * 测试目标: 4 线程并发执行 X→IS 降级无错误
+ *
+ * 运行路径: 参见上方 "Test 6" 块注释
+ * 覆盖: client.c treelock_downgrade() — grant IS + release X + wake 流程
+ */
 TEST(Concurrent, LockDowngrade)
 {
     pthread_t threads[DOWNGRADE_THREADS];
@@ -357,7 +546,25 @@ TEST(Concurrent, LockDowngrade)
 }
 
 /* =========================================================================
- * Test 7: concurrent unlock_all
+ * Test 7: 并发 unlock_all
+ *
+ * 测试目标: 验证 treelock_unlock_all() 在并发环境下正确批量释放锁，
+ *          逆序释放 + 锁表同步不产生数据竞争。
+ *
+ * 运行路径:
+ *   每个线程的每轮迭代:
+ *     获取 5 个不同节点的 IX 锁:
+ *       treelock_try_lock(tl, node, IX, 500ms) × 5
+ *         → held_locks[] 累计 5 条记录
+ *     treelock_unlock_all(tl)
+ *       → client.c: treelock_unlock_all()
+ *         → while (held_count > 0):
+ *             取 held_locks[held_count-1] (最后一个 = 最后获取的 → 逆序)
+ *             treelock_table_release_lock(node, cid, mode)
+ *             treelock_table_wake_waiters(node)
+ *         → held_count = 0
+ *
+ * 验证: 4 线程 × 50 轮 = 200 次 unlock_all 无错误
  * ========================================================================= */
 
 #define UNLOCKALL_THREADS (4)
@@ -395,6 +602,12 @@ static void *unlockall_worker(void *arg) {
     return nullptr;
 }
 
+/**
+ * 测试目标: 4 线程并发批量 lock → unlock_all 循环
+ *
+ * 运行路径: 参见上方 "Test 7" 块注释
+ * 覆盖: client.c treelock_unlock_all() — 逆序释放 + 全量清理
+ */
 TEST(Concurrent, UnlockAll)
 {
     pthread_t threads[UNLOCKALL_THREADS];
@@ -414,7 +627,25 @@ TEST(Concurrent, UnlockAll)
 }
 
 /* =========================================================================
- * Test 8: query_node during concurrent access
+ * Test 8: 并发查询操作
+ *
+ * 测试目标: 验证 treelock_get_mode() 和 treelock_query_node() 在
+ *          多线程并发 lock/unlock 时不返回错误数据。
+ *
+ * 运行路径:
+ *   所有线程共享 tl:
+ *     for 500 ops:
+ *       treelock_try_lock(tl, node, IS, 50ms)
+ *         → 获取成功则:
+ *           treelock_get_mode(tl, node)
+ *             → held_mutex lock → _find_held_lock() → 返回 mode
+ *           treelock_query_node(tl, node, &json)
+ *             → table_mutex lock → treelock_table_find()
+ *             → node->mutex lock → 遍历 grants[] → 构造 JSON
+ *             → 调用者 free(json)
+ *           treelock_unlock(tl, node)
+ *
+ * 验证: get_mode 不返回错误模式, query_node 至少成功一次
  * ========================================================================= */
 
 static volatile int g_query_ops     = 0;
@@ -444,6 +675,12 @@ static void *query_worker(void *arg) {
     return nullptr;
 }
 
+/**
+ * 测试目标: 4 线程并发 lock → get_mode/query_node → unlock
+ *
+ * 运行路径: 参见上方 "Test 8" 块注释
+ * 覆盖: client.c treelock_get_mode() + treelock_query_node()
+ */
 TEST(Concurrent, QueryDuringConcurrent)
 {
     treelock_config_t cfg;
@@ -471,7 +708,32 @@ TEST(Concurrent, QueryDuringConcurrent)
 }
 
 /* =========================================================================
- * Test 9: multiple waiters FIFO wake on same node
+ * Test 9: 同节点多等待者 FIFO 唤醒
+ *
+ * 测试目标: 验证多个请求者等待同一节点的锁时，释放锁后等待队列能正确
+ *          唤醒兼容的等待者（不崩溃、至少有人获取到锁）。
+ *
+ * 运行路径:
+ *   treelock_lock(tl, 9999, X) → 主线程先持有 X
+ *   8 个子线程:
+ *     treelock_try_lock(tl, 9999, X, 3000ms) → 全部入等待队列
+ *       → lock_table.c: treelock_table_check_conflict() → FALSE (X 冲突)
+ *       → lock_table.c: treelock_table_add_waiter()
+ *         → wait_queue 扩展 + pthread_cond_init
+ *       → pthread_cond_timedwait(&entry->cond, &node->mutex, 3000ms)
+ *   sleep(100ms) 确保所有 waiter 入队
+ *   treelock_unlock(tl, 9999) → 释放 X
+ *     → lock_table.c: treelock_table_release_lock() → grant 列表清空
+ *     → lock_table.c: treelock_table_wake_waiters()
+ *       → 遍历 wait_queue, 对每个 waiter 检查冲突
+ *       → 第一个 waiter: 无冲突 → treelock_table_grant_lock(X)
+ *         → pthread_cond_signal(&entry->cond)  → waiter 被唤醒
+ *       → 第二个 waiter: 有冲突 (第一个的 X) → 保留在队列
+ *       ... 依次类推，直到所有兼容的 waiter 被唤醒
+ *   每个被唤醒的 waiter: pthread_cond_timedwait 返回 0 → 验证 grant
+ *     → treelock_unlock(tl, 9999) → 再次 wake (连锁唤醒)
+ *
+ * 验证: 至少 1 个 waiter 成功获取（X 互斥，其他人超时）
  * ========================================================================= */
 
 typedef struct {
@@ -493,6 +755,13 @@ static void *fifo_waiter(void *arg) {
     return nullptr;
 }
 
+/**
+ * 测试目标: 同节点 8 waiter 竞争 X → 至少 1 人获取成功
+ *
+ * 运行路径: 参见上方 "Test 9" 块注释
+ * 覆盖: lock_table.c treelock_table_add_waiter() + treelock_table_wake_waiters()
+ *       (FIFO 扫描 + grant + cond_signal + swap-remove)
+ */
 TEST(Concurrent, MultipleWaitersSameNode)
 {
     treelock_config_t cfg;
