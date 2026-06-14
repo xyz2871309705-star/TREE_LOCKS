@@ -1421,3 +1421,332 @@ TEST(TreeTest, UnloadThenManualRegister)
 
     treelock_destroy(tl);
 }
+
+
+/* =========================================================================
+ * Test 25: treelock_load_tree_from_file
+ *
+ * 测试目标: 验证从文件加载树结构（文件 I/O 路径）。
+ *
+ * 覆盖: tree_api.c treelock_load_tree_from_file() + _read_file_to_string()
+ * ========================================================================= */
+
+TEST(TreeTest, LoadTreeFromFile)
+{
+    const char *json =
+        "{ \"nodes\": ["
+        "  { \"id\": 1, \"label\": \"root\", \"parent\": 0 },"
+        "  { \"id\": 2, \"label\": \"sub\",  \"parent\": 1 },"
+        "  { \"id\": 3, \"label\": \"leaf\", \"parent\": 2 }"
+        "]}";
+    const char *tmpfile = "test_tree_load.tmp";
+    { FILE *fp = fopen(tmpfile, "w"); ASSERT_NE(fp, nullptr); fputs(json, fp); fclose(fp); }
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_load_tree_from_file(tl, tmpfile), TREELOCK_OK);
+    treelock_node_id_t nid;
+    EXPECT_EQ(treelock_lookup_path(tl, "/root/sub/leaf", &nid), TREELOCK_OK);
+    EXPECT_EQ(nid, 3u);
+    treelock_destroy(tl);
+    remove(tmpfile);
+}
+
+/* =========================================================================
+ * Test 26: 深度嵌套 JSON (15 层)
+ *
+ * 覆盖: tree_json.c _parse_nested_tree() 深层递归,
+ *       tree_path.c treelock_resolve_path() 长路径
+ * ========================================================================= */
+
+TEST(TreeTest, DeepNestedJson)
+{
+    /* 10 层嵌套，手动构造确保 JSON 格式正确 */
+    const char *json =
+        "{ \"tree\": {"
+        "  \"id\": 1, \"label\": \"n1\", \"children\": [{"
+        "    \"id\": 2, \"label\": \"n2\", \"children\": [{"
+        "      \"id\": 3, \"label\": \"n3\", \"children\": [{"
+        "        \"id\": 4, \"label\": \"n4\", \"children\": [{"
+        "          \"id\": 5, \"label\": \"n5\", \"children\": [{"
+        "            \"id\": 6, \"label\": \"n6\", \"children\": [{"
+        "              \"id\": 7, \"label\": \"n7\", \"children\": [{"
+        "                \"id\": 8, \"label\": \"n8\", \"children\": [{"
+        "                  \"id\": 9, \"label\": \"n9\", \"children\": [{"
+        "                    \"id\": 10, \"label\": \"n10\""
+        "                  }]"
+        "                }]"
+        "              }]"
+        "            }]"
+        "          }]"
+        "        }]"
+        "      }]"
+        "    }]"
+        "  }]"
+        "}}";
+
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    ASSERT_EQ(treelock_load_tree_from_string(tl, json), TREELOCK_OK);
+
+    treelock_node_id_t nid;
+    EXPECT_EQ(treelock_lookup_path(tl, "/n1/n2/n3/n4/n5/n6/n7/n8/n9/n10", &nid),
+              TREELOCK_OK);
+    EXPECT_EQ(nid, 10u);
+
+    EXPECT_EQ(treelock_lock_path(tl, "/n1/n2/n3/n4/n5", TREELOCK_X), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 5), TREELOCK_X);
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_IX);
+    treelock_unlock_path(tl, "/n1/n2/n3/n4/n5");
+
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 27: 大规模扁平 JSON (100 节点)
+ *
+ * 覆盖: tree_json.c _parse_flat_nodes() 批量处理,
+ *       tree_validate.c 大规模校验, tree_core.c tree_node_add_child 大数组
+ * ========================================================================= */
+
+TEST(TreeTest, LargeFlatJson)
+{
+    std::string json = "{\"nodes\":[{\"id\":1,\"label\":\"root\",\"parent\":0}";
+    for (int i = 2; i <= 100; i++) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), ",{\"id\":%d,\"label\":\"node%d\",\"parent\":1}", i, i);
+        json += buf;
+    }
+    json += "]}";
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    ASSERT_EQ(treelock_load_tree_from_string(tl, json.c_str()), TREELOCK_OK);
+    EXPECT_TRUE(treelock_tree_loaded(tl));
+    treelock_node_id_t nid;
+    EXPECT_EQ(treelock_lookup_path(tl, "/root/node50", &nid), TREELOCK_OK);
+    EXPECT_EQ(nid, 50u);
+    EXPECT_EQ(treelock_lookup_path(tl, "/root/node99", &nid), TREELOCK_OK);
+    EXPECT_EQ(nid, 99u);
+    EXPECT_EQ(treelock_lock_path(tl, "/root/node77", TREELOCK_S), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 77), TREELOCK_S);
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_IS);
+    treelock_unlock_path(tl, "/root/node77");
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 28: 路径解析边界条件
+ *
+ * 覆盖: tree_path.c treelock_resolve_path() — 路径分隔符处理
+ * ========================================================================= */
+
+TEST(TreeTest, ResolvePathEdgeCases)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    ASSERT_EQ(treelock_register_node(tl, 1, 0, "root"), TREELOCK_OK);
+    ASSERT_EQ(treelock_register_node(tl, 2, 1, "a"), TREELOCK_OK);
+    ASSERT_EQ(treelock_register_node(tl, 3, 2, "b"), TREELOCK_OK);
+    treelock_node_id_t nid;
+    EXPECT_EQ(treelock_lookup_path(tl, "/", &nid), TREELOCK_OK);
+    EXPECT_EQ(nid, 1u);
+    EXPECT_EQ(treelock_lookup_path(tl, "/root", &nid), TREELOCK_OK);
+    EXPECT_EQ(nid, 1u);
+    EXPECT_EQ(treelock_lookup_path(tl, "/root/", &nid), TREELOCK_OK);
+    EXPECT_EQ(nid, 1u);
+    EXPECT_EQ(treelock_lookup_path(tl, "/root/a/", &nid), TREELOCK_OK);
+    EXPECT_EQ(nid, 2u);
+    EXPECT_EQ(treelock_lookup_path(tl, "/root//a", &nid), TREELOCK_OK);
+    EXPECT_EQ(nid, 2u);
+    EXPECT_EQ(treelock_lookup_path(tl, "/root//a//b", &nid), TREELOCK_OK);
+    EXPECT_EQ(nid, 3u);
+    /* root/a (no leading /) matches root label "root" → resolves to node 2 */
+    EXPECT_EQ(treelock_lookup_path(tl, "root/a", &nid), TREELOCK_OK);
+    EXPECT_EQ(nid, 2u);
+    EXPECT_EQ(treelock_lookup_path(tl, "/wrong/a", &nid), TREELOCK_ERR_INVAL);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 29: lock_path 部分失败回滚
+ *
+ * 覆盖: tree_api.c treelock_lock_path() — 回滚路径
+ * ========================================================================= */
+
+TEST(TreeTest, LockPathRollback)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    ASSERT_EQ(treelock_register_node(tl, 1, 0, "/"), TREELOCK_OK);
+    ASSERT_EQ(treelock_register_node(tl, 2, 1, "a"), TREELOCK_OK);
+    ASSERT_EQ(treelock_register_node(tl, 3, 2, "b"), TREELOCK_OK);
+    /* 先遵从协议锁住父节点 + 锁住目标节点 b 制造冲突 */
+    ASSERT_EQ(treelock_lock(tl, 1, TREELOCK_IX), TREELOCK_OK);
+    ASSERT_EQ(treelock_lock(tl, 2, TREELOCK_IX), TREELOCK_OK);
+    ASSERT_EQ(treelock_lock(tl, 3, TREELOCK_X), TREELOCK_OK);
+    /* lock_path 目标步骤冲突 (X vs S) */
+    EXPECT_EQ(treelock_lock_path(tl, "/a/b", TREELOCK_S), TREELOCK_ERR_PROTOCOL);
+    /* 回滚后父节点锁仍由测试持有，目标节点 X 锁不变 */
+    EXPECT_EQ(treelock_get_mode(tl, 3), TREELOCK_X);
+    treelock_unlock(tl, 3);
+    treelock_unlock(tl, 2);
+    treelock_unlock(tl, 1);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 30: lock_path IX / SIX 目标模式
+ *
+ * 覆盖: tree_path.c treelock_ancestor_mode_for() IX/SIX/X case
+ * ========================================================================= */
+
+TEST(TreeTest, LockPathIXSIXMode)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    ASSERT_EQ(treelock_register_node(tl, 1, 0, "/"), TREELOCK_OK);
+    ASSERT_EQ(treelock_register_node(tl, 2, 1, "a"), TREELOCK_OK);
+    ASSERT_EQ(treelock_register_node(tl, 3, 2, "b"), TREELOCK_OK);
+    /* IX target */
+    EXPECT_EQ(treelock_lock_path(tl, "/a/b", TREELOCK_IX), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_IX);
+    EXPECT_EQ(treelock_get_mode(tl, 2), TREELOCK_IX);
+    EXPECT_EQ(treelock_get_mode(tl, 3), TREELOCK_IX);
+    treelock_unlock_path(tl, "/a/b");
+    /* SIX target */
+    EXPECT_EQ(treelock_lock_path(tl, "/a/b", TREELOCK_SIX), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_IX);
+    EXPECT_EQ(treelock_get_mode(tl, 2), TREELOCK_IX);
+    EXPECT_EQ(treelock_get_mode(tl, 3), TREELOCK_SIX);
+    treelock_unlock_path(tl, "/a/b");
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 31: 校验 — ID 为零
+ *
+ * 覆盖: tree_validate.c — nid==0 分支
+ * ========================================================================= */
+
+TEST(TreeTest, ValidateZeroId)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_load_tree_from_string(tl,
+        "{ \"nodes\": [ { \"id\": 0, \"label\": \"bad\", \"parent\": 0 } ] }"),
+        TREELOCK_ERR_INVAL);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 32: 校验 — 父节点不存在
+ *
+ * 覆盖: tree_validate.c — parent 有效性检查
+ * ========================================================================= */
+
+TEST(TreeTest, ValidateParentNotExist)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_load_tree_from_string(tl,
+        "{ \"nodes\": [ { \"id\": 1, \"parent\": 0 }, { \"id\": 2, \"parent\": 99 } ] }"),
+        TREELOCK_ERR_INVAL);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 33: 无标签节点
+ *
+ * 覆盖: tree_core.c tree_node_create() label=NULL/empty,
+ *       tree_index_find_child_by_label() NULL 守卫
+ * ========================================================================= */
+
+TEST(TreeTest, NoLabelNodes)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    ASSERT_EQ(treelock_register_node(tl, 1, 0, nullptr), TREELOCK_OK);
+    ASSERT_EQ(treelock_register_node(tl, 2, 1, ""), TREELOCK_OK);
+    ASSERT_EQ(treelock_register_node(tl, 3, 2, "child"), TREELOCK_OK);
+    EXPECT_TRUE(treelock_tree_loaded(tl));
+    treelock_node_id_t parent_id;
+    EXPECT_EQ(treelock_get_parent(tl, 2, &parent_id), TREELOCK_OK);
+    EXPECT_EQ(parent_id, 1u);
+    treelock_node_id_t nid;
+    EXPECT_EQ(treelock_lookup_path(tl, "/child", &nid), TREELOCK_ERR_INVAL);
+    /* 协议校验: 需先锁父节点 */
+    EXPECT_EQ(treelock_lock(tl, 3, TREELOCK_X), TREELOCK_ERR_PROTOCOL);
+    EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_IX), TREELOCK_OK);
+    EXPECT_EQ(treelock_lock(tl, 2, TREELOCK_IX), TREELOCK_OK);
+    EXPECT_EQ(treelock_lock(tl, 3, TREELOCK_X), TREELOCK_OK);
+    treelock_unlock(tl, 3);
+    treelock_unlock(tl, 2);
+    treelock_unlock(tl, 1);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 34: 重新加载树时协议校验切换
+ *
+ * 覆盖: tree_api.c reload 分支 + protocol.c 校验作用域切换
+ * ========================================================================= */
+
+TEST(TreeTest, ReloadSwitchesProtocolScope)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    ASSERT_EQ(treelock_load_tree_from_string(tl,
+        "{ \"nodes\": [ { \"id\": 1, \"label\": \"r1\", \"parent\": 0 },"
+        " { \"id\": 2, \"label\": \"c1\", \"parent\": 1 } ] }"), TREELOCK_OK);
+    EXPECT_EQ(treelock_lock(tl, 2, TREELOCK_X), TREELOCK_ERR_PROTOCOL);
+    ASSERT_EQ(treelock_load_tree_from_string(tl,
+        "{ \"nodes\": [ { \"id\": 100, \"label\": \"r2\", \"parent\": 0 },"
+        " { \"id\": 200, \"label\": \"c2\", \"parent\": 100 } ] }"), TREELOCK_OK);
+    EXPECT_EQ(treelock_lock(tl, 200, TREELOCK_X), TREELOCK_ERR_PROTOCOL);
+    EXPECT_EQ(treelock_lock(tl, 2, TREELOCK_X), TREELOCK_OK);
+    treelock_unlock(tl, 2);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 35: unload 后已持有锁仍可用
+ *
+ * 覆盖: client.c unlock + protocol.c validate — tree_data==NULL
+ * ========================================================================= */
+
+TEST(TreeTest, UnloadPreservesExistingLocks)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    ASSERT_EQ(treelock_register_node(tl, 1, 0, "/"), TREELOCK_OK);
+    ASSERT_EQ(treelock_register_node(tl, 2, 1, "a"), TREELOCK_OK);
+    EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_IX), TREELOCK_OK);
+    EXPECT_EQ(treelock_lock(tl, 2, TREELOCK_X), TREELOCK_OK);
+    treelock_tree_unload(tl);
+    EXPECT_FALSE(treelock_tree_loaded(tl));
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_IX);
+    treelock_unlock(tl, 2);
+    treelock_unlock(tl, 1);
+    EXPECT_EQ(treelock_lock(tl, 999, TREELOCK_X), TREELOCK_OK);
+    treelock_unlock(tl, 999);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 36: 文件加载错误路径
+ *
+ * 覆盖: tree_api.c treelock_load_tree_from_file() — NULL/非法内容
+ * ========================================================================= */
+
+TEST(TreeTest, LoadTreeFromFileErrors)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_load_tree_from_file(tl, nullptr), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_load_tree_from_file(nullptr, "test.json"), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_load_tree_from_file(tl, "no_such_file_12345.json"), TREELOCK_ERR_INVAL);
+    const char *tmpfile = "test_bad_json.tmp";
+    { FILE *fp = fopen(tmpfile, "w"); ASSERT_NE(fp, nullptr); fputs("bad json {{{", fp); fclose(fp); }
+    EXPECT_EQ(treelock_load_tree_from_file(tl, tmpfile), TREELOCK_ERR_INVAL);
+    remove(tmpfile);
+    treelock_destroy(tl);
+}

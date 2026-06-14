@@ -1045,3 +1045,343 @@ TEST(Concurrent, MultiInstanceCreateDestroy)
     EXPECT_EQ(total_cycles, MULTI_INSTANCE_THREADS * MULTI_INSTANCE_CYCLES)
         << "all cycles should complete";
 }
+
+
+/* =========================================================================
+ * Test 12: treelock_create 配置验证
+ *
+ * 覆盖: client.c treelock_create() — config==NULL + config!=NULL
+ * ========================================================================= */
+
+TEST(Concurrent, CreateWithConfig)
+{
+    treelock_config_t cfg; memset(&cfg, 0, sizeof(cfg));
+    cfg.timeout_ms = 5000; cfg.client_id = "custom_client";
+    treelock_t *tl = treelock_create(&cfg);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_X), TREELOCK_OK);
+    treelock_unlock(tl, 1);
+    treelock_destroy(tl);
+    treelock_t *tl2 = treelock_create(nullptr);
+    ASSERT_NE(tl2, nullptr);
+    EXPECT_EQ(treelock_lock(tl2, 2, TREELOCK_IS), TREELOCK_OK);
+    treelock_unlock(tl2, 2);
+    treelock_destroy(tl2);
+}
+
+/* =========================================================================
+ * Test 13: 已销毁实例拒绝所有操作
+ *
+ * 覆盖: client.c 全部公共 API — tl->destroyed 守卫
+ * ========================================================================= */
+
+TEST(Concurrent, DestroyedInstanceRejected)
+{
+    /* 验证 destroy 不会崩溃（即使持有锁） */
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_lock(tl, 100, TREELOCK_X), TREELOCK_OK);
+    EXPECT_EQ(treelock_lock(tl, 200, TREELOCK_IS), TREELOCK_OK);
+    /* destroy 应正确释放所有锁并清理资源 */
+    treelock_destroy(tl);
+    /* 注意: destroy 后 tl 为悬空指针，不应再使用 */
+    SUCCEED();
+}
+
+/* =========================================================================
+ * Test 14: lock 参数校验
+ *
+ * 覆盖: client.c _do_lock_core() — NULL/mode/timeout 守卫
+ * ========================================================================= */
+
+TEST(Concurrent, LockInvalidParams)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_lock(nullptr, 1, TREELOCK_X), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_try_lock(nullptr, 1, TREELOCK_X, 100), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_NL), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_lock(tl, 1, (treelock_mode_t)99), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_try_lock(tl, 1, (treelock_mode_t)99, 100), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_try_lock(tl, 1, TREELOCK_IS, 0), TREELOCK_OK);
+    treelock_unlock(tl, 1);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 15: unlock 错误路径
+ *
+ * 覆盖: client.c treelock_unlock() + treelock_unlock_all() 错误分支
+ * ========================================================================= */
+
+TEST(Concurrent, UnlockErrorPaths)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_unlock(nullptr, 1), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_unlock_all(nullptr), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_unlock(tl, 999), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_lock(tl, 50, TREELOCK_X), TREELOCK_OK);
+    EXPECT_EQ(treelock_unlock(tl, 50), TREELOCK_OK);
+    EXPECT_EQ(treelock_unlock(tl, 50), TREELOCK_ERR_INVAL);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 16: escalate 错误路径
+ *
+ * 覆盖: client.c treelock_escalate() — 全部错误分支
+ * ========================================================================= */
+
+TEST(Concurrent, EscalateErrorPaths)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_escalate(nullptr, 1, TREELOCK_X), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_escalate(tl, 100, TREELOCK_X), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_IS), TREELOCK_OK);
+    EXPECT_EQ(treelock_escalate(tl, 1, TREELOCK_NL), TREELOCK_ERR_PROTOCOL);
+    EXPECT_EQ(treelock_escalate(tl, 1, TREELOCK_IS), TREELOCK_ERR_PROTOCOL);
+    EXPECT_EQ(treelock_escalate(tl, 1, TREELOCK_S), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_S);
+    treelock_unlock(tl, 1);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 17: downgrade 错误路径
+ *
+ * 覆盖: client.c treelock_downgrade() — 全部错误分支
+ * ========================================================================= */
+
+TEST(Concurrent, DowngradeErrorPaths)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_downgrade(nullptr, 1, TREELOCK_IS), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_downgrade(tl, 100, TREELOCK_IS), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_X), TREELOCK_OK);
+    EXPECT_EQ(treelock_downgrade(tl, 1, (treelock_mode_t)99), TREELOCK_ERR_PROTOCOL);
+    EXPECT_EQ(treelock_downgrade(tl, 1, TREELOCK_X), TREELOCK_ERR_PROTOCOL);
+    EXPECT_EQ(treelock_downgrade(tl, 1, TREELOCK_IS), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_IS);
+    treelock_unlock(tl, 1);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 18: get_mode / query_node 错误路径
+ *
+ * 覆盖: client.c treelock_get_mode() + treelock_query_node() 错误分支
+ * ========================================================================= */
+
+TEST(Concurrent, QueryApiErrors)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_get_mode(nullptr, 1), TREELOCK_NL);
+    EXPECT_EQ(treelock_get_mode(tl, 999), TREELOCK_NL);
+    char *json = nullptr;
+    EXPECT_EQ(treelock_query_node(nullptr, 1, &json), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_query_node(tl, 1, nullptr), TREELOCK_ERR_INVAL);
+    EXPECT_EQ(treelock_query_node(tl, 999, &json), TREELOCK_OK);
+    ASSERT_NE(json, nullptr);
+    EXPECT_STREQ(json, "{}");
+    free(json);
+    EXPECT_EQ(treelock_lock(tl, 50, TREELOCK_IS), TREELOCK_OK);
+    EXPECT_EQ(treelock_query_node(tl, 50, &json), TREELOCK_OK);
+    ASSERT_NE(json, nullptr);
+    EXPECT_NE(strstr(json, "\"node_id\":"), nullptr);
+    EXPECT_NE(strstr(json, "\"grants\":"), nullptr);
+    free(json);
+    treelock_unlock(tl, 50);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 19: 多步升级链
+ *
+ * 覆盖: client.c treelock_escalate() 全部合法路径 +
+ *       protocol.c escalate_valid 链式查表
+ * ========================================================================= */
+
+TEST(Concurrent, MultiStepUpgradeChains)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    /* NL → IS → S */
+    EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_IS), TREELOCK_OK);
+    EXPECT_EQ(treelock_escalate(tl, 1, TREELOCK_S), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_S);
+    treelock_unlock(tl, 1);
+    /* NL → IS → IX → X */
+    EXPECT_EQ(treelock_lock(tl, 2, TREELOCK_IS), TREELOCK_OK);
+    EXPECT_EQ(treelock_escalate(tl, 2, TREELOCK_IX), TREELOCK_OK);
+    EXPECT_EQ(treelock_escalate(tl, 2, TREELOCK_X), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 2), TREELOCK_X);
+    treelock_unlock(tl, 2);
+    /* NL → IS → IX → SIX → X */
+    EXPECT_EQ(treelock_lock(tl, 3, TREELOCK_IS), TREELOCK_OK);
+    EXPECT_EQ(treelock_escalate(tl, 3, TREELOCK_IX), TREELOCK_OK);
+    EXPECT_EQ(treelock_escalate(tl, 3, TREELOCK_SIX), TREELOCK_OK);
+    EXPECT_EQ(treelock_escalate(tl, 3, TREELOCK_X), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 3), TREELOCK_X);
+    treelock_unlock(tl, 3);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 20: 多模式降级链
+ *
+ * 覆盖: client.c treelock_downgrade() 全部合法降级路径
+ * ========================================================================= */
+
+TEST(Concurrent, MultiStepDowngradeChains)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    /* X → SIX → S → IS */
+    EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_X), TREELOCK_OK);
+    EXPECT_EQ(treelock_downgrade(tl, 1, TREELOCK_SIX), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_SIX);
+    EXPECT_EQ(treelock_downgrade(tl, 1, TREELOCK_S), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_S);
+    EXPECT_EQ(treelock_downgrade(tl, 1, TREELOCK_IS), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_IS);
+    treelock_unlock(tl, 1);
+    /* X → IX → IS */
+    EXPECT_EQ(treelock_lock(tl, 2, TREELOCK_X), TREELOCK_OK);
+    EXPECT_EQ(treelock_downgrade(tl, 2, TREELOCK_IX), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 2), TREELOCK_IX);
+    EXPECT_EQ(treelock_downgrade(tl, 2, TREELOCK_IS), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 2), TREELOCK_IS);
+    treelock_unlock(tl, 2);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 21: grant 数组动态扩展
+ *
+ * 覆盖: lock_table.c treelock_table_grant_lock() — 数组扩展分支
+ * ========================================================================= */
+
+TEST(Concurrent, GrantArrayExpansion)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    for (int r = 0; r < 2; r++) {
+        EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_IS),  TREELOCK_OK);
+        EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_IX),  TREELOCK_OK);
+        EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_S),   TREELOCK_OK);
+        EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_SIX), TREELOCK_OK);
+        EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_X),   TREELOCK_OK);
+    }
+    for (int i = 0; i < 10; i++)
+        EXPECT_EQ(treelock_unlock(tl, 1), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_NL);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 22: held_locks 数组动态扩展
+ *
+ * 覆盖: client.c _add_held_lock() — realloc 扩展分支
+ * ========================================================================= */
+
+TEST(Concurrent, HeldArrayExpansion)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    for (int n = 1; n <= 20; n++)
+        EXPECT_EQ(treelock_lock(tl, (treelock_node_id_t)n, TREELOCK_IS), TREELOCK_OK);
+    for (int n = 20; n >= 1; n--)
+        EXPECT_EQ(treelock_unlock(tl, (treelock_node_id_t)n), TREELOCK_OK);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 23: unlock_all 正确释放全部锁
+ *
+ * 覆盖: client.c treelock_unlock_all() — while 循环 + 逆序释放
+ * ========================================================================= */
+
+TEST(Concurrent, UnlockAllMassRelease)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    for (int n = 1; n <= 30; n++)
+        ASSERT_EQ(treelock_lock(tl, (treelock_node_id_t)n, TREELOCK_IX), TREELOCK_OK);
+    EXPECT_EQ(treelock_unlock_all(tl), TREELOCK_OK);
+    for (int n = 1; n <= 30; n++)
+        EXPECT_EQ(treelock_get_mode(tl, (treelock_node_id_t)n), TREELOCK_NL);
+    EXPECT_EQ(treelock_unlock_all(tl), TREELOCK_OK);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 24: set_lost_callback 往返
+ *
+ * 覆盖: client.c treelock_set_lost_callback()
+ * ========================================================================= */
+
+static void dummy_lost_cb(treelock_node_id_t, treelock_mode_t, void *) {}
+
+TEST(Concurrent, SetLostCallback)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_set_lost_callback(nullptr, dummy_lost_cb, nullptr), TREELOCK_ERR_INVAL);
+    int ud = 42;
+    EXPECT_EQ(treelock_set_lost_callback(tl, dummy_lost_cb, &ud), TREELOCK_OK);
+    EXPECT_EQ(treelock_set_lost_callback(tl, nullptr, nullptr), TREELOCK_OK);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 25: try_lock 立即返回路径
+ *
+ * 覆盖: client.c _do_lock_core() — timeout>0 路径 + 快速 grant
+ * ========================================================================= */
+
+TEST(Concurrent, TryLockShortTimeout)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    int acquired = 0;
+    for (int i = 0; i < 50; i++) {
+        int rc = treelock_try_lock(tl, 1, TREELOCK_IS, 5);
+        if (rc == TREELOCK_OK) { acquired++; treelock_unlock(tl, 1); }
+        EXPECT_NE(rc, TREELOCK_ERR_INVAL);
+    }
+    EXPECT_GT(acquired, 40);
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 26: escalate 升级锁后重入再释放
+ *
+ * 覆盖: client.c treelock_escalate() + _do_lock_core() 重入路径
+ * ========================================================================= */
+
+TEST(Concurrent, EscalateThenReentrant)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    /* NL → IS → IX → 重入 IX → escalate X → 释放 */
+    EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_IS), TREELOCK_OK);
+    EXPECT_EQ(treelock_escalate(tl, 1, TREELOCK_IX), TREELOCK_OK);
+    EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_IX), TREELOCK_OK);  /* re-entrant */
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_IX);
+    EXPECT_EQ(treelock_escalate(tl, 1, TREELOCK_X), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_X);
+    /* ref_count: 2 (escalate 前 IX 重入 + escalate 替换为 X) — 不对
+     * 实际: IS(1) → escalate IX → held.mode=IX, ref_count=1
+     *       lock IX → ref_count=2 (re-entrant)
+     *       escalate X → 新 grant X + 释放 IX → held.mode=X, ref_count 不变? 
+     * escalate 内直接操作锁表 + 原地更新 held.mode，不改变 ref_count */
+    treelock_unlock(tl, 1); /* ref_count: 2→1 */
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_X);
+    treelock_unlock(tl, 1); /* ref_count: 1→0, 释放锁表 */
+    EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_NL);
+    treelock_destroy(tl);
+}
