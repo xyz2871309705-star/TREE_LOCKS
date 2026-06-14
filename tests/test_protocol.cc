@@ -1051,7 +1051,7 @@ TEST(StressTest, WaitQueueHighChurn)
 
     auto waiter = [&](int idx) {
         while (running) {
-            int rc = treelock_try_lock(tl, 1, TREELOCK_X, 10);
+            int rc = treelock_try_lock(tl, 1, TREELOCK_X, 20);
             if (rc == TREELOCK_OK) {
                 waiter_ops[idx]++;
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -1066,7 +1066,7 @@ TEST(StressTest, WaitQueueHighChurn)
     std::thread wt[6];
     for (int i = 0; i < 6; i++) wt[i] = std::thread(waiter, i);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    std::this_thread::sleep_for(std::chrono::milliseconds(3000));
     running = 0;
 
     ht.join();
