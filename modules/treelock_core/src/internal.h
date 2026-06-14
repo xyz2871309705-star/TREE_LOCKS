@@ -11,6 +11,7 @@
 #define TREELOCK_INTERNAL_H
 
 #include "treelock.h"
+#include "uthash.h"
 #include <pthread.h>
 
 #ifdef __cplusplus
@@ -146,11 +147,12 @@ typedef struct treelock_node_s {
     treelock_grant_t       *grants;          /**< 已授予的锁列表（动态数组） */
     UINT_64                 grant_count;     /**< 已授予的锁数量             */
     UINT_64                 grant_capacity;  /**< 锁列表容量                 */
-    treelock_wait_entry_t  *wait_queue;      /**< 等待队列（动态数组）       */
+    treelock_wait_entry_t **wait_queue;      /**< 等待队列（指针数组，避免 realloc 拷贝 pthread_cond_t） */
     UINT_64                 wait_count;      /**< 等待队列当前长度           */
     UINT_64                 wait_capacity;   /**< 等待队列容量               */
     pthread_mutex_t         mutex;           /**< 节点级互斥锁               */
-    struct treelock_node_s *next;            /**< 哈希表链表指针             */
+    struct treelock_node_s *next;            /**< 保留字段（uthash 迭代辅助） */
+    UT_hash_handle          hh;              /**< uthash 哈希句柄（O(1) 查找） */
 } treelock_node_t;
 
 /* =========================================================================
@@ -175,6 +177,11 @@ typedef treelock_node_id_t (*treelock_tree_get_parent_fn)(
     treelock_node_id_t    node_id
 );
 
+/** 树结构销毁回调类型（由 treelock_tree 模块注册） */
+typedef VOID (*treelock_tree_destroy_fn)(
+    PTR_VOID              tree_data
+);
+
 struct treelock_s {
     /* ── 配置 ── */
     treelock_config_t   config;        /**< 客户端配置                 */
@@ -196,6 +203,7 @@ struct treelock_s {
     /* ── 树结构桥接（由 treelock_tree 模块注入）── */
     PTR_VOID                     tree_data;        /**< 不透明树索引指针    */
     treelock_tree_get_parent_fn  tree_get_parent;  /**< 父节点查询回调      */
+    treelock_tree_destroy_fn     tree_destroy;     /**< 树结构销毁回调      */
 
     /* ── 状态 ── */
     INT_32              connected;     /**< 连接状态（阶段一始终为 TRUE） */

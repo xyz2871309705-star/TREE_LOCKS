@@ -51,6 +51,30 @@ static treelock_node_id_t _tree_get_parent_cb(
     return node->parent_id;
 }
 
+/**
+ * 函数名称：_tree_destroy_cb
+ *
+ * 功能描述：供 treelock_core 内部调用的树结构销毁回调
+ *
+ *          由 treelock_destroy() 触发，避免 treelock_core
+ *          直接依赖 treelock_tree（保持模块解耦）。
+ *
+ * @param[IN] tree_data - 不透明树索引指针（实际为 treelock_tree_index_t *）
+ */
+static VOID _tree_destroy_cb(
+    IN PTR_VOID tree_data)
+{
+    treelock_tree_index_t *idx;
+
+    if (tree_data == NULL) {
+        return;
+    }
+
+    idx = (treelock_tree_index_t *)tree_data;
+    tree_index_destroy(idx);
+    free(idx);
+}
+
 /* =========================================================================
  * 辅助: 文件读取
  * ========================================================================= */
@@ -189,6 +213,7 @@ RET_CODE treelock_load_tree_from_string(
         free(tl->tree_data);
         tl->tree_data       = NULL;
         tl->tree_get_parent = NULL;
+        tl->tree_destroy    = NULL;
     }
 
     /* 分配树索引 */
@@ -210,6 +235,7 @@ RET_CODE treelock_load_tree_from_string(
     /* 注册桥接到 treelock_core */
     tl->tree_data       = (PTR_VOID)idx;
     tl->tree_get_parent = _tree_get_parent_cb;
+    tl->tree_destroy    = _tree_destroy_cb;
 
     TREELOCK_LOG_INFO("TREE", "tree loaded into client '%s': %llu nodes",
                       tl->config.client_id ? tl->config.client_id : "local",
@@ -255,6 +281,7 @@ RET_CODE treelock_register_node(
         tree_index_init(idx);
         tl->tree_data       = (PTR_VOID)idx;
         tl->tree_get_parent = _tree_get_parent_cb;
+        tl->tree_destroy    = _tree_destroy_cb;
         TREELOCK_LOG_DEBUG("TREE", "lazy-init tree index for register_node");
     } else {
         idx = (treelock_tree_index_t *)tl->tree_data;
@@ -308,8 +335,9 @@ RET_CODE treelock_register_node(
         /* parent_node 已在校验阶段确认为非 NULL */
         rc = tree_node_add_child(parent_node, node);
         if (rc != TREELOCK_OK) {
-            /* 回滚：从 hash 表中移除已插入的节点 */
-            /* 简化处理：标记 node 为孤儿，由 tree_index_destroy 统一释放 */
+            /* 回滚：从 hash 表中移除已插入的节点并释放 */
+            tree_index_remove(idx, node_id);
+            tree_node_destroy(node);
             return TREELOCK_ERR_INVAL;
         }
     } else {
@@ -325,6 +353,33 @@ RET_CODE treelock_register_node(
         label ? label : "(null)");
 
     return TREELOCK_OK;
+}
+
+/**
+ * 函数名称：treelock_tree_unload
+ *
+ * 功能描述：卸载当前加载的树结构，释放所有树节点内存
+ *
+ *          卸载后协议校验回退为宽松模式（不检查父节点锁）。
+ *          未加载树时调用无副作用。
+ *
+ * @param[IN] tl - 锁句柄
+ */
+VOID treelock_tree_unload(
+    IN treelock_t *tl)
+{
+    if (tl == NULL || tl->tree_data == NULL) {
+        return;
+    }
+
+    TREELOCK_LOG_INFO("TREE", "unloading tree from client '%s'",
+                      tl->config.client_id ? tl->config.client_id : "local");
+
+    tree_index_destroy((treelock_tree_index_t *)tl->tree_data);
+    free(tl->tree_data);
+    tl->tree_data       = NULL;
+    tl->tree_get_parent = NULL;
+    tl->tree_destroy    = NULL;
 }
 
 /**

@@ -61,7 +61,7 @@ static VOID _str_copy_safe(
 /**
  * 函数名称：treelock_table_find
  *
- * 功能描述：按节点 ID 在锁表链表中查找节点
+ * 功能描述：按节点 ID 在锁表哈希表中查找节点（O(1) 平均）
  *
  * @param[IN] tl      - 锁句柄
  * @param[IN] node_id - 节点 ID
@@ -78,14 +78,9 @@ treelock_node_t *treelock_table_find(
         return NULL;
     }
 
-    node = tl->lock_table;
-    while (node != NULL) {
-        if (node->node_id == node_id) {
-            return node;
-        }
-        node = node->next;
-    }
-    return NULL;
+    HASH_FIND(hh, tl->lock_table, &node_id,
+              sizeof(treelock_node_id_t), node);
+    return node;
 }
 
 /**
@@ -93,7 +88,7 @@ treelock_node_t *treelock_table_find(
  *
  * 功能描述：按节点 ID 查找锁表节点，若不存在则分配并初始化新节点
  *
- *          新节点插入链表头部以加速热点访问。
+ *          使用 uthash 哈希表实现 O(1) 平均查找与插入。
  *
  * @param[IN] tl      - 锁句柄
  * @param[IN] node_id - 节点 ID
@@ -110,7 +105,8 @@ treelock_node_t *treelock_table_get_or_create(
         return NULL;
     }
 
-    node = treelock_table_find(tl, node_id);
+    HASH_FIND(hh, tl->lock_table, &node_id,
+              sizeof(treelock_node_id_t), node);
     if (node != NULL) {
         return node;
     }
@@ -135,9 +131,9 @@ treelock_node_t *treelock_table_get_or_create(
         return NULL;
     }
 
-    /* 插入链表头部 */
-    node->next = tl->lock_table;
-    tl->lock_table = node;
+    /* 加入哈希表 */
+    HASH_ADD_KEYPTR(hh, tl->lock_table, &node->node_id,
+                    sizeof(treelock_node_id_t), node);
 
     TREELOCK_LOG_DEBUG("TABLE", "new node created: node_id=%llu",
                        (unsigned long long)node_id);
@@ -341,18 +337,18 @@ RET_CODE treelock_table_add_waiter(
         return TREELOCK_ERR_INVAL;
     }
 
-    /* 扩展队列 */
+    /* 扩展队列（指针数组，realloc 只移动指针，不拷贝 pthread_cond_t） */
     if (node->wait_count >= node->wait_capacity) {
         UINT_64 new_cap;
-        treelock_wait_entry_t *new_queue;
+        treelock_wait_entry_t **new_queue;
 
         new_cap = (node->wait_capacity == 0)
                   ? TREELOCK_WAIT_INIT_CAP
                   : node->wait_capacity * 2;
 
-        new_queue = (treelock_wait_entry_t *)realloc(
+        new_queue = (treelock_wait_entry_t **)realloc(
             node->wait_queue,
-            (size_t)(new_cap * sizeof(treelock_wait_entry_t)));
+            (size_t)(new_cap * sizeof(treelock_wait_entry_t *)));
         if (new_queue == NULL) {
             TREELOCK_LOG_ERROR("TABLE",
                 "failed to expand wait queue: node=%llu cap=%llu→%llu (OOM)",
@@ -365,9 +361,18 @@ RET_CODE treelock_table_add_waiter(
         node->wait_capacity = new_cap;
     }
 
-    /* 添加等待者 */
+    /* 分配等待者条目并加入队列 */
     {
-        treelock_wait_entry_t *entry = &node->wait_queue[node->wait_count];
+        treelock_wait_entry_t *entry;
+
+        entry = (treelock_wait_entry_t *)malloc(sizeof(treelock_wait_entry_t));
+        if (entry == NULL) {
+            TREELOCK_LOG_ERROR("TABLE",
+                "failed to allocate waiter entry: node=%llu client=%s (OOM)",
+                (unsigned long long)node->node_id, client_id);
+            return TREELOCK_ERR_INVAL;
+        }
+
         _str_copy_safe(entry->client_id, client_id, TREELOCK_CLIENT_ID_MAX);
         entry->requested_mode = mode;
         entry->enqueue_time   = _current_time_ms();
@@ -376,8 +381,11 @@ RET_CODE treelock_table_add_waiter(
             TREELOCK_LOG_ERROR("TABLE",
                 "failed to init cond for waiter: node=%llu client=%s",
                 (unsigned long long)node->node_id, client_id);
+            free(entry);
             return TREELOCK_ERR_INVAL;
         }
+
+        node->wait_queue[node->wait_count] = entry;
     }
 
     node->wait_count++;
@@ -413,7 +421,7 @@ VOID treelock_table_wake_waiters(
     }
 
     for (i = 0; i < node->wait_count; /* 循环内更新 */) {
-        treelock_wait_entry_t *entry = &node->wait_queue[i];
+        treelock_wait_entry_t *entry = node->wait_queue[i];
 
         if (treelock_table_check_conflict(node, entry->client_id,
                                            entry->requested_mode)) {
@@ -430,26 +438,17 @@ VOID treelock_table_wake_waiters(
                 entry->client_id);
             pthread_cond_signal(&entry->cond);
             /*
-             * 注意：不在此处 pthread_cond_destroy，因为被唤醒的线程
-             * 可能尚未从 pthread_cond_wait 完全返回（仍在等待重新获取
-             * node->mutex）。cond 由 _do_lock_core 中被唤醒的线程在
-             * 成功获取锁后负责销毁（或超时路径自行销毁）。
-             * 未使用的 cond 在 treelock_destroy 的清理循环中释放。
+             * cond 不在此处销毁：被唤醒的线程可能尚未从
+             * pthread_cond_wait 完全返回。cond 由 _do_lock_core
+             * 中被唤醒的线程在成功后负责 destroy + free(entry)。
              */
 
-            /* swap-remove 从队列中移除（逐字段拷贝，避免 pthread_cond_t 整体赋值） */
+            /*
+             * swap-remove：移动最后一个指针到当前位置。
+             * 指针数组的 realloc 不会拷贝 pthread_cond_t，消除 UB。
+             */
             if (i < node->wait_count - 1) {
-                memcpy(node->wait_queue[i].client_id,
-                       node->wait_queue[node->wait_count - 1].client_id,
-                       TREELOCK_CLIENT_ID_MAX);
-                node->wait_queue[i].requested_mode =
-                    node->wait_queue[node->wait_count - 1].requested_mode;
-                node->wait_queue[i].enqueue_time =
-                    node->wait_queue[node->wait_count - 1].enqueue_time;
-                /*
-                 * cond 不拷贝：保留位置 i 原有的 cond（已由 _do_lock_core
-                 * 中被唤醒的线程负责销毁，或由 treelock_destroy 清理）。
-                 */
+                node->wait_queue[i] = node->wait_queue[node->wait_count - 1];
             }
             node->wait_count--;
             /* 不递增 i：当前位置已替换为新元素，需重新检查 */

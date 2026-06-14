@@ -46,6 +46,7 @@ target_link_libraries(${MODULE_NAME}
     PUBLIC
         treelock_log
         Threads::Threads
+        uthash
 )
 
 # ── 警告 ──

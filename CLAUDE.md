@@ -135,18 +135,48 @@ TREELOCK_LOG_ERROR("TAG", "failed: %d", code);
 
 ## Test Framework
 
-A lightweight inline framework (no external test library). Each test binary is standalone:
+Uses **Google Test (GTest)** via `FetchContent`. Tests are C++ (`.cc`) calling C code under test via `extern "C"`.
 
-```c
-test_begin("description of the test");
-if (condition) {
-    test_pass("optional detail");
-} else {
-    test_fail("reason for failure");
+```cpp
+#include <gtest/gtest.h>
+extern "C" { #include "treelock.h" }
+
+TEST(SuiteName, TestName) {
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_X), TREELOCK_OK);
+    treelock_destroy(tl);
 }
 ```
 
-Tests link against module static libs and are granted access to `src/` private headers via `target_include_directories`. Test JSON fixture files are copied to the build directory at configure time.
+### 当前测试概况 (113 用例)
+
+| 二进制 | 用例数 | 覆盖模块 | 密度 |
+|--------|--------|---------|------|
+| `test_protocol` | 30 | `protocol.c` + 压力/死锁/内存 | — |
+| `test_log` | 15 | `log_core.c` | 15.0/KLOC ✅ |
+| `test_concurrent` | 27 | `client.c`, `lock_table.c` | — |
+| `test_tree` | 41 | `tree_*.c` (5 files) | 15.2/KLOC ✅ |
+| **合计** | **113** | — | **16.9/KLOC** |
+
+### 测试规范 (强制)
+
+1. **每 API 必有专属测试** — 新增 `treelock_*.h` 公开函数 → 至少 1 个 `TEST()` 直接调用
+2. **每 API 必有关联测试** — API 间协作链 (如 `lock_path` → `resolve` + `lock` + `validate`) 必须覆盖
+3. **新模块 ≥ 15 用例/KLOC** — `MIN = ceil(源码行数/1000) × 15`
+4. **测试注释** — 每个 `TEST()` 上方须有 `目标/路径/覆盖` 块注释
+5. **修改代码同步 TEST_STRATEGY.md** — 增删改用例必须更新文档计数
+
+### 测试类别覆盖
+
+| 类别 | 覆盖 | 示例 |
+|------|------|------|
+| 协议纯逻辑 | ✅ 100% | 兼容矩阵全 36 组合、升降级全路径 |
+| API 参数校验 | ✅ | NULL/destroyed/非法 mode |
+| 并发安全性 | ✅ | 8 线程共享实例、死锁预防 |
+| 内存管理 | ✅ | 100 周期 create/destroy、数组回缩 |
+| 压力 | ✅ | 1M 查询、1K 升降级循环、1.5s 队列 churn |
+| 树操作 | ✅ | 文件/字符串加载、10 层嵌套、100 节点 |
 
 ## Key Design Decisions
 

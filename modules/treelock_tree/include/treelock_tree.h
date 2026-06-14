@@ -93,6 +93,20 @@ RET_CODE treelock_register_node(
 );
 
 /**
+ * 函数名称：treelock_tree_unload
+ *
+ * 功能描述：卸载当前加载的树结构，释放所有树节点内存
+ *
+ *          卸载后协议校验自动回退为宽松模式（不检查父节点锁）。
+ *          未加载树时调用无副作用。
+ *
+ * @param[IN] tl - 锁句柄
+ */
+VOID treelock_tree_unload(
+    IN treelock_t *tl
+);
+
+/**
  * 函数名称：treelock_tree_loaded
  *
  * 功能描述：查询树结构是否已加载

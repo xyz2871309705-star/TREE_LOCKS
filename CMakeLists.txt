@@ -99,6 +99,9 @@ include(GNUInstallDirs)
 # 第三方: 轻量级 JSON 解析器
 add_subdirectory(modules/cjson)
 
+# 第三方: C 哈希表库 (header-only)
+add_subdirectory(modules/uthash)
+
 # 模块 0: 日志模块
 add_subdirectory(modules/treelock_log)
 

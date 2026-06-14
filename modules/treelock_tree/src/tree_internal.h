@@ -190,6 +190,23 @@ treelock_tree_node_t *tree_index_find(
 );
 
 /**
+ * 函数名称：tree_index_remove
+ *
+ * 功能描述：从树索引 hash 表中移除指定节点（不释放内存）
+ *
+ *          调用者负责释放节点内存。用于回滚操作。
+ *
+ * @param[INOUT] idx     - 树索引指针
+ * @param[IN]    node_id - 要移除的节点 ID
+ *
+ * @return TRUE 移除成功，FALSE 节点不存在
+ */
+INT_32 tree_index_remove(
+    INOUT treelock_tree_index_t *idx,
+    IN    treelock_node_id_t     node_id
+);
+
+/**
  * 函数名称：tree_index_find_child_by_label
  *
  * 功能描述：在指定父节点的子节点中查找具有给定标签的子节点
