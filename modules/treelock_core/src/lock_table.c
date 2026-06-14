@@ -439,6 +439,13 @@ VOID treelock_table_wake_waiters(
 
             /* swap-remove 从队列中移除（逐字段拷贝，避免 pthread_cond_t 整体赋值） */
             if (i < node->wait_count - 1) {
+                /*
+                 * 销毁队列末尾将被移出的条目的 cond ——
+                 * 其数据将被拷贝到位置 i，原 cond 不再被任何 waiter 使用。
+                 * 不销毁会导致下次 add_waiter 在该槽位重复 pthread_cond_init（UB）。
+                 */
+                pthread_cond_destroy(
+                    &node->wait_queue[node->wait_count - 1].cond);
                 memcpy(node->wait_queue[i].client_id,
                        node->wait_queue[node->wait_count - 1].client_id,
                        TREELOCK_CLIENT_ID_MAX);

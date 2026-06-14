@@ -175,6 +175,11 @@ typedef treelock_node_id_t (*treelock_tree_get_parent_fn)(
     treelock_node_id_t    node_id
 );
 
+/** 树结构销毁回调类型（由 treelock_tree 模块注册） */
+typedef VOID (*treelock_tree_destroy_fn)(
+    PTR_VOID              tree_data
+);
+
 struct treelock_s {
     /* ── 配置 ── */
     treelock_config_t   config;        /**< 客户端配置                 */
@@ -196,6 +201,7 @@ struct treelock_s {
     /* ── 树结构桥接（由 treelock_tree 模块注入）── */
     PTR_VOID                     tree_data;        /**< 不透明树索引指针    */
     treelock_tree_get_parent_fn  tree_get_parent;  /**< 父节点查询回调      */
+    treelock_tree_destroy_fn     tree_destroy;     /**< 树结构销毁回调      */
 
     /* ── 状态 ── */
     INT_32              connected;     /**< 连接状态（阶段一始终为 TRUE） */

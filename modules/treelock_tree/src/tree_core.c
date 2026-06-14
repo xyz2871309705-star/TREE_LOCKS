@@ -170,37 +170,15 @@ VOID tree_index_init(
 }
 
 /**
- * 函数名称：_tree_index_destroy_nodes
- *
- * 功能描述：递归销毁树节点及其子树
- *
- * @param[IN] node - 要销毁的节点（递归释放所有子节点）
- */
-static VOID _tree_index_destroy_nodes(
-    IN treelock_tree_node_t *node)
-{
-    UINT_32 i;
-
-    if (node == NULL) {
-        return;
-    }
-
-    /* 先递归销毁子节点 */
-    for (i = 0; i < node->child_count; i++) {
-        _tree_index_destroy_nodes(node->children[i]);
-    }
-
-    /* 再销毁自身（此时 children 数组可安全释放） */
-    tree_node_destroy(node);
-}
-
-/**
  * 函数名称：tree_index_destroy
  *
- * 功能描述：销毁树结构索引，递归释放所有节点内存
+ * 功能描述：销毁树结构索引，释放所有节点内存
  *
- *          从根节点开始递归释放整棵树。
- *          同时清理 hash 表中的所有指针，防止悬空指针。
+ *          遍历所有 hash 桶释放节点，不依赖根节点可达性。
+ *          这确保即使存在孤儿节点（如 tree_node_add_child 失败后
+ *          残留在 hash 表中的节点）也能被正确释放。
+ *          tree_node_destroy 不递归销毁子节点，因此直接遍历
+ *          hash 桶逐个释放是安全的，不会产生 double-free。
  *
  * @param[INOUT] idx - 树索引指针
  */
@@ -214,17 +192,17 @@ VOID tree_index_destroy(
     }
 
     /*
-     * 从根节点递归销毁整棵树（通过 children 链遍历所有可达节点）。
+     * 遍历所有 hash 桶，释放每个桶链表中的所有节点。
+     * tree_node_destroy 释放 label、children 指针数组和节点自身，
+     * 但不递归销毁 children 指向的子节点 → 无 double-free 风险。
      */
-    if (idx->root_id != TREE_ROOT_PARENT) {
-        treelock_tree_node_t *root = tree_index_find(idx, idx->root_id);
-        if (root != NULL) {
-            _tree_index_destroy_nodes(root);
-        }
-    }
-
-    /* 清理 hash 表 ——  所有从 root 可达的节点已释放，清空指针 */
     for (i = 0; i < TREE_HASH_BUCKETS; i++) {
+        treelock_tree_node_t *node = idx->node_hash[i];
+        while (node != NULL) {
+            treelock_tree_node_t *next = node->next;
+            tree_node_destroy(node);
+            node = next;
+        }
         idx->node_hash[i] = NULL;
     }
 
@@ -308,6 +286,53 @@ treelock_tree_node_t *tree_index_find(
         node = node->next;
     }
     return NULL;
+}
+
+/**
+ * 函数名称：tree_index_remove
+ *
+ * 功能描述：从树索引的 hash 表中移除指定节点（不释放内存）
+ *
+ *          仅从 hash 链表中摘除节点，调用者负责释放节点内存。
+ *          用于回滚操作（如 tree_node_add_child 失败后清理）。
+ *
+ * @param[INOUT] idx     - 树索引指针
+ * @param[IN]    node_id - 要移除的节点 ID
+ *
+ * @return 移除成功返回 TRUE，节点不存在返回 FALSE
+ */
+INT_32 tree_index_remove(
+    INOUT treelock_tree_index_t *idx,
+    IN    treelock_node_id_t     node_id)
+{
+    UINT_32 bucket;
+    treelock_tree_node_t *prev;
+    treelock_tree_node_t *curr;
+
+    if (idx == NULL) {
+        return FALSE;
+    }
+
+    bucket = tree_hash_node_id(node_id);
+    prev   = NULL;
+    curr   = idx->node_hash[bucket];
+
+    while (curr != NULL) {
+        if (curr->node_id == node_id) {
+            /* 从链表中移除 */
+            if (prev == NULL) {
+                idx->node_hash[bucket] = curr->next;
+            } else {
+                prev->next = curr->next;
+            }
+            curr->next = NULL;
+            idx->node_count--;
+            return TRUE;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+    return FALSE;
 }
 
 /**

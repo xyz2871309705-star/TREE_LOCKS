@@ -351,8 +351,15 @@ static RET_CODE _do_lock_core(
                 for (j = 0; j < node->wait_count; j++) {
                     if (&node->wait_queue[j] == entry) {
                         pthread_cond_destroy(&entry->cond);
-                        /* swap-remove：逐字段拷贝，避免 pthread_cond_t 整体赋值 */
+                        /* swap-remove：销毁末尾 cond 后逐字段拷贝数据 */
                         if (j < node->wait_count - 1) {
+                            /*
+                             * 销毁末尾条目的 cond —— 其数据将被拷贝到位置 j，
+                             * 原 cond 不再被任何 waiter 使用，避免下次
+                             * add_waiter 重复 pthread_cond_init（UB）。
+                             */
+                            pthread_cond_destroy(
+                                &node->wait_queue[node->wait_count - 1].cond);
                             memcpy(node->wait_queue[j].client_id,
                                    node->wait_queue[node->wait_count - 1].client_id,
                                    TREELOCK_CLIENT_ID_MAX);
@@ -400,6 +407,8 @@ static RET_CODE _do_lock_core(
                 }
             }
             if (!granted) {
+                /* 未能获取锁 → 销毁自己的 cond 并返回错误 */
+                pthread_cond_destroy(&entry->cond);
                 pthread_mutex_unlock(&node->mutex);
                 TREELOCK_LOG_WARN("CORE",
                     "lock stale after wake: node=%llu mode=%s client=%s",
@@ -407,6 +416,12 @@ static RET_CODE _do_lock_core(
                     treelock_mode_name(mode), cid);
                 return TREELOCK_ERR_STALE;
             }
+            /*
+             * 成功获取锁 → 销毁自己的 cond。
+             * wake_waiters 已将本条目 swap-remove 出队列，
+             * 此 cond 不再被任何人使用。
+             */
+            pthread_cond_destroy(&entry->cond);
             TREELOCK_LOG_TRACE("CORE",
                 "woken and granted: node=%llu mode=%s client=%s",
                 (unsigned long long)node_id,
@@ -542,9 +557,28 @@ VOID treelock_destroy(
     treelock_unlock_all(tl);
     tl->destroyed = TRUE;
 
-    /* 清空树结构桥接（树模块负责实际内存释放） */
+    /*
+     * 同步屏障：lock+unlock 每个节点的 mutex，确保被 treelock_unlock_all
+     * 唤醒的线程已完全退出 pthread_cond_wait 并释放了 node->mutex。
+     * 这不能防御调用者在线程仍在使用句柄时调用 destroy 的情况，
+     * 但可以消除 unlock_all 与被唤醒线程之间的竞态窗口。
+     */
+    pthread_mutex_lock(&tl->table_mutex);
+    node = tl->lock_table;
+    while (node != NULL) {
+        pthread_mutex_lock(&node->mutex);
+        pthread_mutex_unlock(&node->mutex);
+        node = node->next;
+    }
+    pthread_mutex_unlock(&tl->table_mutex);
+
+    /* 卸载树结构（通过回调委托 treelock_tree 模块释放内存） */
+    if (tl->tree_data != NULL && tl->tree_destroy != NULL) {
+        tl->tree_destroy(tl->tree_data);
+    }
     tl->tree_data       = NULL;
     tl->tree_get_parent = NULL;
+    tl->tree_destroy    = NULL;
 
     /* 清理锁表 */
     pthread_mutex_lock(&tl->table_mutex);
