@@ -135,18 +135,52 @@ TREELOCK_LOG_ERROR("TAG", "failed: %d", code);
 
 ## Test Framework
 
-A lightweight inline framework (no external test library). Each test binary is standalone:
+Uses **Google Test (GTest)** via `FetchContent`. Tests are written in C++ (`.cc`) and call C code under test via `extern "C"` blocks.
 
-```c
-test_begin("description of the test");
-if (condition) {
-    test_pass("optional detail");
-} else {
-    test_fail("reason for failure");
+```cpp
+#include <gtest/gtest.h>
+extern "C" { #include "treelock.h" }
+
+TEST(SuiteName, TestName) {
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+    EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_X), TREELOCK_OK);
+    treelock_destroy(tl);
 }
 ```
 
-Tests link against module static libs and are granted access to `src/` private headers via `target_include_directories`. Test JSON fixture files are copied to the build directory at configure time.
+### Test binary → module mapping
+
+| Binary | Links | Covers |
+|--------|-------|--------|
+| `test_protocol` | `treelock_core` | `protocol.c` |
+| `test_log` | `treelock_log`, `treelock_core` | `log_core.c` |
+| `test_concurrent` | `treelock_core`, `treelock_tree` | `client.c`, `lock_table.c` |
+| `test_tree` | `treelock_tree` | `tree_*.c` |
+
+### Testing Rules (mandatory)
+
+1. **每一个对外 API 必须有专属测试**：新增/修改 `treelock_*.h` 中的任何公开函数，必须在对应测试文件中添加至少一个直接调用该 API 的 `TEST()` 用例。
+
+2. **每一个对外 API 必须有关联测试**：API 之间如果有协作（如 `lock_path` 依赖 `lock`+`resolve_path`），必须添加验证协作链的测试用例。
+
+3. **新增模块的测试密度 ≥ 15 用例/KLOC**：
+   - 添加新模块（如新的 `treelock_*` 子目录）时，按模块源码行数（`.c` + `.h`，不含第三方库）计算最低测试用例数。
+   - 公式：`MIN_TESTS = ceil(total_lines / 1000) × 15`
+   - 各模块当前达标情况：
+
+   | 模块 | 源码行数 | 测试用例 | 密度 | 状态 |
+   |------|---------|---------|------|------|
+   | `treelock_log` | ~1.0K | 15 | 15.0 | ✅ |
+   | `treelock_core` | ~3.0K | 31 (19 + 12) | 10.3 | ⚠️ 待补充 |
+   | `treelock_tree` | ~2.7K | 29 | 10.7 | ⚠️ 待补充 |
+
+4. **测试文件注释规范**：每个 `TEST()` 上方必须有一个 `/** … */` 块注释，说明：
+   - `测试目标：` — 验证什么
+   - `运行路径：` — 关键函数调用链
+   - `覆盖：` — 具体 `.c` 文件和函数
+
+5. **修改代码必须同步更新 `docs/TEST_STRATEGY.md`**：新增/删除/改名测试用例时，同步更新该文档中的用例清单和计数。
 
 ## Key Design Decisions
 
