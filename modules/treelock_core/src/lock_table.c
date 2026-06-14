@@ -61,7 +61,7 @@ static VOID _str_copy_safe(
 /**
  * 函数名称：treelock_table_find
  *
- * 功能描述：按节点 ID 在锁表链表中查找节点
+ * 功能描述：按节点 ID 在锁表哈希表中查找节点（O(1) 平均）
  *
  * @param[IN] tl      - 锁句柄
  * @param[IN] node_id - 节点 ID
@@ -78,14 +78,9 @@ treelock_node_t *treelock_table_find(
         return NULL;
     }
 
-    node = tl->lock_table;
-    while (node != NULL) {
-        if (node->node_id == node_id) {
-            return node;
-        }
-        node = node->next;
-    }
-    return NULL;
+    HASH_FIND(hh, tl->lock_table, &node_id,
+              sizeof(treelock_node_id_t), node);
+    return node;
 }
 
 /**
@@ -93,7 +88,7 @@ treelock_node_t *treelock_table_find(
  *
  * 功能描述：按节点 ID 查找锁表节点，若不存在则分配并初始化新节点
  *
- *          新节点插入链表头部以加速热点访问。
+ *          使用 uthash 哈希表实现 O(1) 平均查找与插入。
  *
  * @param[IN] tl      - 锁句柄
  * @param[IN] node_id - 节点 ID
@@ -110,7 +105,8 @@ treelock_node_t *treelock_table_get_or_create(
         return NULL;
     }
 
-    node = treelock_table_find(tl, node_id);
+    HASH_FIND(hh, tl->lock_table, &node_id,
+              sizeof(treelock_node_id_t), node);
     if (node != NULL) {
         return node;
     }
@@ -135,9 +131,9 @@ treelock_node_t *treelock_table_get_or_create(
         return NULL;
     }
 
-    /* 插入链表头部 */
-    node->next = tl->lock_table;
-    tl->lock_table = node;
+    /* 加入哈希表 */
+    HASH_ADD_KEYPTR(hh, tl->lock_table, &node->node_id,
+                    sizeof(treelock_node_id_t), node);
 
     TREELOCK_LOG_DEBUG("TABLE", "new node created: node_id=%llu",
                        (unsigned long long)node_id);

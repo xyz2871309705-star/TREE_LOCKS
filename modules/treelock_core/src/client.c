@@ -541,8 +541,6 @@ treelock_t *treelock_create(
 VOID treelock_destroy(
     IN treelock_t *tl)
 {
-    treelock_node_t *node;
-    treelock_node_t *next;
     UINT_64 i;
 
     if (tl == NULL) {
@@ -564,11 +562,12 @@ VOID treelock_destroy(
      * 但可以消除 unlock_all 与被唤醒线程之间的竞态窗口。
      */
     pthread_mutex_lock(&tl->table_mutex);
-    node = tl->lock_table;
-    while (node != NULL) {
-        pthread_mutex_lock(&node->mutex);
-        pthread_mutex_unlock(&node->mutex);
-        node = node->next;
+    {
+        treelock_node_t *barrier_node, *barrier_tmp;
+        HASH_ITER(hh, tl->lock_table, barrier_node, barrier_tmp) {
+            pthread_mutex_lock(&barrier_node->mutex);
+            pthread_mutex_unlock(&barrier_node->mutex);
+        }
     }
     pthread_mutex_unlock(&tl->table_mutex);
 
@@ -580,28 +579,31 @@ VOID treelock_destroy(
     tl->tree_get_parent = NULL;
     tl->tree_destroy    = NULL;
 
-    /* 清理锁表 */
+    /* 清理锁表（哈希表迭代） */
     pthread_mutex_lock(&tl->table_mutex);
-    node = tl->lock_table;
-    while (node != NULL) {
-        next = node->next;
+    {
+        treelock_node_t *cleanup_node, *cleanup_tmp;
+        HASH_ITER(hh, tl->lock_table, cleanup_node, cleanup_tmp) {
+            /* 释放动态数组 */
+            free(cleanup_node->grants);
+            cleanup_node->grants = NULL;
 
-        /* 释放动态数组 */
-        free(node->grants);
-        node->grants = NULL;
+            /* 销毁等待队列中的所有条件变量（含 swap-remove 残留的） */
+            for (i = 0; i < cleanup_node->wait_capacity; i++) {
+                pthread_cond_destroy(
+                    &cleanup_node->wait_queue[i].cond);
+            }
+            free(cleanup_node->wait_queue);
+            cleanup_node->wait_queue = NULL;
 
-        /* 销毁等待队列中的所有条件变量（含 swap-remove 残留的） */
-        for (i = 0; i < node->wait_capacity; i++) {
-            pthread_cond_destroy(&node->wait_queue[i].cond);
+            pthread_mutex_destroy(&cleanup_node->mutex);
+
+            /* 从哈希表中移除后释放节点内存 */
+            HASH_DEL(tl->lock_table, cleanup_node);
+            free(cleanup_node);
         }
-        free(node->wait_queue);
-        node->wait_queue = NULL;
-
-        pthread_mutex_destroy(&node->mutex);
-        free(node);
-        node = next;
+        tl->lock_table = NULL;
     }
-    tl->lock_table = NULL;
     pthread_mutex_unlock(&tl->table_mutex);
 
     /* 释放已持有锁列表 */

@@ -11,6 +11,7 @@
 #define TREELOCK_INTERNAL_H
 
 #include "treelock.h"
+#include "uthash.h"
 #include <pthread.h>
 
 #ifdef __cplusplus
@@ -150,7 +151,8 @@ typedef struct treelock_node_s {
     UINT_64                 wait_count;      /**< 等待队列当前长度           */
     UINT_64                 wait_capacity;   /**< 等待队列容量               */
     pthread_mutex_t         mutex;           /**< 节点级互斥锁               */
-    struct treelock_node_s *next;            /**< 哈希表链表指针             */
+    struct treelock_node_s *next;            /**< 保留字段（uthash 迭代辅助） */
+    UT_hash_handle          hh;              /**< uthash 哈希句柄（O(1) 查找） */
 } treelock_node_t;
 
 /* =========================================================================

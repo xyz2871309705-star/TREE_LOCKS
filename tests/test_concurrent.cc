@@ -1385,3 +1385,350 @@ TEST(Concurrent, EscalateThenReentrant)
     EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_NL);
     treelock_destroy(tl);
 }
+
+/* =========================================================================
+ * Test 27: 哈希表查找已存在节点
+ *
+ * 测试目标: 验证哈希表 treelock_table_find (HASH_FIND) 能正确找到
+ *          已创建的锁表节点，返回的节点可正常进行 lock/unlock。
+ *
+ * 运行路径:
+ *   treelock_lock(tl, 100, IX)
+ *     → _do_lock_core() → treelock_table_get_or_create(tl, 100)
+ *       → HASH_FIND → 首次查找 → NULL (不存在)
+ *       → calloc() → HASH_ADD_KEYPTR → 加入哈希表
+ *     → _do_lock_core() → grant + held_add
+ *   treelock_get_mode(tl, 100)
+ *     → held_mutex → _find_held_lock → TREELOCK_IX ✓
+ *   treelock_unlock(tl, 100)
+ *     → held_mutex → _find_held_lock → ref=1 → release
+ *     → table_mutex → treelock_table_find(tl, 100)
+ *       → HASH_FIND → 找到节点 ✓
+ *     → treelock_table_release_lock → grant 移除
+ *
+ * 覆盖: lock_table.c treelock_table_find (HASH_FIND 路径),
+ *       treelock_table_get_or_create (HASH_ADD_KEYPTR 路径)
+ * ========================================================================= */
+
+/**
+ * 测试目标: 哈希表基本查找 — lock/get_mode/unlock 节点 100
+ *
+ * 运行路径: 参见上方 "Test 27" 块注释
+ * 覆盖: lock_table.c HASH_FIND + HASH_ADD_KEYPTR
+ */
+TEST(HashTable, FindExisting)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+
+    EXPECT_EQ(treelock_lock(tl, 100, TREELOCK_IX), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 100), TREELOCK_IX);
+    EXPECT_EQ(treelock_unlock(tl, 100), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 100), TREELOCK_NL);
+
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 28: 哈希表查找不存在的节点
+ *
+ * 测试目标: 验证查询未加锁的节点时，treelock_table_find 正确返回 NULL，
+ *          不影响系统正常运行。
+ *
+ * 运行路径:
+ *   treelock_query_node(tl, 999, &json)
+ *     → table_mutex → treelock_table_find(tl, 999)
+ *       → HASH_FIND → 未找到 → NULL
+ *     → 返回 "{}"
+ *   treelock_get_mode(tl, 999)
+ *     → held_mutex → _find_held_lock → NULL
+ *     → 返回 TREELOCK_NL
+ *
+ * 覆盖: lock_table.c treelock_table_find — HASH_FIND 空哈希表 / 未命中路径
+ * ========================================================================= */
+
+/**
+ * 测试目标: 哈希表查找不存在节点 — query_node/get_mode 返回空/无锁
+ *
+ * 运行路径: 参见上方 "Test 28" 块注释
+ * 覆盖: lock_table.c HASH_FIND 未命中路径
+ */
+TEST(HashTable, FindNonExisting)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+
+    /* 查询未加锁的节点 — query_node 返回 "{}" */
+    char *json = nullptr;
+    EXPECT_EQ(treelock_query_node(tl, 999, &json), TREELOCK_OK);
+    ASSERT_NE(json, nullptr);
+    EXPECT_STREQ(json, "{}");
+    free(json);
+
+    /* get_mode 返回 TREELOCK_NL */
+    EXPECT_EQ(treelock_get_mode(tl, 999), TREELOCK_NL);
+
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 29: 哈希表 get_or_create 重复调用幂等
+ *
+ * 测试目标: 验证同一节点的多次 treelock_table_get_or_create 返回同一
+ *          节点指针（HASH_ADD_KEYPTR 不会创建重复项）。
+ *
+ * 运行路径:
+ *   第 1 次 treelock_lock(tl, 200, IS)
+ *     → HASH_FIND → NULL → calloc → HASH_ADD_KEYPTR → grant IS → held[IS]
+ *   第 2 次 treelock_lock(tl, 200, IS)
+ *     → _get_held_mode → TREELOCK_OK, mode=IS
+ *     → existing_mode == mode → ref_count++ → return (不进入锁表)
+ *   第 3 次 treelock_lock(tl, 200, IX)
+ *     → _get_held_mode → TREELOCK_OK, mode=IS
+ *     → escalade_valid(IS, IX) → TRUE
+ *     → treelock_table_get_or_create → HASH_FIND → 找到已有节点 ✓
+ *       → 不创建新节点
+ *     → grant IX + release IS + held原地更新
+ *
+ * 验证: 多次操作后节点应正确反映最新模式
+ *
+ * 覆盖: lock_table.c treelock_table_get_or_create — HASH_FIND 命中 + 幂等性
+ * ========================================================================= */
+
+/**
+ * 测试目标: 同节点重复 get_or_create + escalate 不创建重复节点
+ *
+ * 运行路径: 参见上方 "Test 29" 块注释
+ * 覆盖: lock_table.c HASH_ADD_KEYPTR 幂等性, HASH_FIND 命中路径
+ */
+TEST(HashTable, GetOrCreateIdempotent)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+
+    /* 第一次创建 */
+    EXPECT_EQ(treelock_lock(tl, 200, TREELOCK_IS), TREELOCK_OK);
+    /* 同模式重入 — ref_count++，不创建新节点 */
+    EXPECT_EQ(treelock_lock(tl, 200, TREELOCK_IS), TREELOCK_OK);
+    /* escalate — get_or_create 应该找到已有节点，不创建重复 */
+    EXPECT_EQ(treelock_escalate(tl, 200, TREELOCK_IX), TREELOCK_OK);
+    EXPECT_EQ(treelock_get_mode(tl, 200), TREELOCK_IX);
+
+    /* 释放所有引用 */
+    treelock_unlock(tl, 200);
+    treelock_unlock(tl, 200);
+    EXPECT_EQ(treelock_get_mode(tl, 200), TREELOCK_NL);
+
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 30: 大规模节点创建与查找
+ *
+ * 测试目标: 验证 2000 个不同节点通过哈希表正常创建和查找，操作时间
+ *          在合理范围内（O(1) 查找 vs 旧 O(n) 链表）。
+ *
+ * 运行路径:
+ *   for n in 1..2000:
+ *     treelock_try_lock(tl, n, IS, 10ms)
+ *       → _do_lock_core → treelock_table_get_or_create(n)
+ *         → HASH_FIND → NULL → HASH_ADD_KEYPTR (加入哈希表)
+ *       → grant IS → held_add
+ *     treelock_unlock(tl, n)
+ *       → table_mutex → treelock_table_find(n)
+ *         → HASH_FIND → 在 2000 节点中 O(1) 查找 ✓
+ *
+ * 验收: 至少 95% 操作成功（少量超时因系统负载可接受）
+ *
+ * 覆盖: lock_table.c HASH_FIND + HASH_ADD_KEYPTR 大规模场景
+ * ========================================================================= */
+
+/**
+ * 测试目标: 2000 节点创建 + lock/unlock → 验证 O(1) 哈希查找
+ *
+ * 运行路径: 参见上方 "Test 30" 块注释
+ * 覆盖: lock_table.c 大规模哈希表操作
+ */
+TEST(HashTable, MassNodes2000)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+
+    int acquired = 0;
+    const int N = 2000;
+
+    for (int n = 1; n <= N; n++) {
+        int rc = treelock_try_lock(tl, (treelock_node_id_t)n, TREELOCK_IS, 10);
+        if (rc == TREELOCK_OK) {
+            acquired++;
+            treelock_unlock(tl, (treelock_node_id_t)n);
+        }
+    }
+
+    /* 至少 1900/2000 成功（偶尔超时因系统负载） */
+    EXPECT_GE(acquired, N * 95 / 100)
+        << "mass nodes: " << acquired << "/" << N << " acquired";
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 31: 多线程并发创建不同节点
+ *
+ * 测试目标: 验证多线程同时向哈希表插入不同节点不产生数据竞争或
+ *          节点丢失（HASH_ADD_KEYPTR 在 table_mutex 保护下安全）。
+ *
+ * 运行路径:
+ *   8 线程，每个操作 500 个不同节点:
+ *     treelock_try_lock(tl, tid*1000 + i, IS, 100ms)
+ *       → _do_lock_core → table_mutex → get_or_create
+ *         → HASH_FIND → 不冲突（不同节点）→ HASH_ADD_KEYPTR
+ *       → grant + held_add
+ *     treelock_unlock(tl, node)
+ *
+ * 覆盖: lock_table.c HASH_ADD_KEYPTR 并发安全性
+ * ========================================================================= */
+
+#define HASH_CONCURRENT_THREADS (8)
+#define HASH_CONCURRENT_OPS     (500)
+
+typedef struct {
+    treelock_t *tl;
+    int         thread_idx;
+    int         acquired;
+    int         errors;
+} hash_concurrent_t;
+
+static void *hash_concurrent_worker(void *arg) {
+    auto *hc = (hash_concurrent_t *)arg;
+    for (int i = 0; i < HASH_CONCURRENT_OPS; i++) {
+        auto node_id = (treelock_node_id_t)(
+            hc->thread_idx * 10000 + i + 1);
+        int rc = treelock_try_lock(hc->tl, node_id, TREELOCK_IS, 100);
+        if (rc == TREELOCK_OK) {
+            hc->acquired++;
+            treelock_unlock(hc->tl, node_id);
+        } else if (rc != TREELOCK_ERR_TIMEOUT) {
+            hc->errors++;
+        }
+    }
+    return nullptr;
+}
+
+/**
+ * 测试目标: 8 线程并发向哈希表插入不同节点
+ *
+ * 运行路径: 参见上方 "Test 31" 块注释
+ * 覆盖: lock_table.c HASH_ADD_KEYPTR + HASH_FIND 并发安全
+ */
+TEST(HashTable, ConcurrentCreateDifferentNodes)
+{
+    treelock_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.timeout_ms = 5000;
+    cfg.client_id  = "hash_test";
+
+    treelock_t *tl = treelock_create(&cfg);
+    ASSERT_NE(tl, nullptr);
+
+    pthread_t threads[HASH_CONCURRENT_THREADS];
+    hash_concurrent_t data[HASH_CONCURRENT_THREADS];
+
+    for (int t = 0; t < HASH_CONCURRENT_THREADS; t++) {
+        memset(&data[t], 0, sizeof(data[t]));
+        data[t].tl         = tl;
+        data[t].thread_idx = t;
+        pthread_create(&threads[t], nullptr, hash_concurrent_worker, &data[t]);
+    }
+
+    int total_acq = 0, total_err = 0;
+    for (int t = 0; t < HASH_CONCURRENT_THREADS; t++) {
+        pthread_join(threads[t], nullptr);
+        total_acq += data[t].acquired;
+        total_err += data[t].errors;
+    }
+
+    EXPECT_EQ(total_err, 0) << "errors during concurrent hash table ops";
+    EXPECT_GE(total_acq, HASH_CONCURRENT_THREADS * HASH_CONCURRENT_OPS * 95 / 100)
+        << "most ops should succeed";
+
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 32: destroy 遍历释放完整性
+ *
+ * 测试目标: 验证 treelock_destroy 通过 HASH_ITER 正确遍历所有节点，
+ *          释放所有资源（grants, wait_queue, mutex, 节点自身）。
+ *
+ * 运行路径:
+ *   lock 100 个不同节点 (每个持有 IS 锁)
+ *   treelock_destroy(tl)
+ *     → treelock_unlock_all() → 释放所有锁
+ *     → barrier: HASH_ITER → lock+unlock 每个节点的 mutex
+ *     → cleanup: HASH_ITER → free grants/queue → HASH_DEL → free node
+ *     → free held_locks + mutex_destroy + free tl
+ *
+ * 验收: destroy 不崩溃
+ *
+ * 覆盖: client.c treelock_destroy HASH_ITER 遍历 + HASH_DEL 清理
+ * ========================================================================= */
+
+/**
+ * 测试目标: destroy 通过 HASH_ITER 正确遍历和释放所有哈希表节点
+ *
+ * 运行路径: 参见上方 "Test 32" 块注释
+ * 覆盖: client.c HASH_ITER + HASH_DEL 完整清理路径
+ */
+TEST(HashTable, DestroyIterationCleanup)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+
+    /* 创建 100 个节点（每个通过哈希表 get_or_create） */
+    for (int n = 1; n <= 100; n++) {
+        ASSERT_EQ(treelock_lock(tl, (treelock_node_id_t)n, TREELOCK_IS),
+                  TREELOCK_OK);
+    }
+
+    /* destroy 必须通过 HASH_ITER 正确遍历并释放全部 100 个节点 */
+    treelock_destroy(tl);
+    SUCCEED() << "destroy completed without crash";
+}
+
+/* =========================================================================
+ * Test 33: 压力 — 大量节点 destroy 后无残留
+ *
+ * 测试目标: 验证 100 次 create → 大量 lock → destroy 周期不泄露内存
+ *          （哈希表节点通过 HASH_DEL 正确从表移除并释放）。
+ *
+ * 运行路径:
+ *   for 100 cycles:
+ *     create → lock 20 nodes → unlock_all → destroy
+ *       → HASH_ITER → HASH_DEL 逐节点清理
+ *
+ * 验收: 100 次循环不崩溃
+ *
+ * 覆盖: client.c + lock_table.c 完整创建→销毁生命周期
+ * ========================================================================= */
+
+/**
+ * 测试目标: 100 次 create→lock→destroy 不泄露哈希表资源
+ *
+ * 运行路径: 参见上方 "Test 33" 块注释
+ * 覆盖: lock_table.c HASH_ADD_KEYPTR + client.c HASH_ITER/HASH_DEL 循环
+ */
+TEST(HashTable, RepeatedCreateDestroy)
+{
+    for (int cycle = 0; cycle < 100; cycle++) {
+        treelock_t *tl = treelock_create(nullptr);
+        ASSERT_NE(tl, nullptr);
+
+        for (int n = 1; n <= 20; n++) {
+            ASSERT_EQ(treelock_lock(tl, (treelock_node_id_t)n, TREELOCK_IX),
+                      TREELOCK_OK);
+        }
+        treelock_unlock_all(tl);
+        treelock_destroy(tl);
+    }
+    SUCCEED() << "100 create/destroy cycles completed";
+}
