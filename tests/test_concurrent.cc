@@ -22,6 +22,7 @@
 
 extern "C" {
 #include "treelock.h"
+#include "treelock_tree.h"
 #include "treelock_log.h"
 #include "treelock_platform.h"
 }
@@ -802,4 +803,245 @@ TEST(Concurrent, MultipleWaitersSameNode)
     EXPECT_GE(acquired_count, 1) << "at least one waiter should acquire the lock";
 
     treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 10: 等待队列高频率进出 (swap-remove 压力)
+ *
+ * 测试目标: 验证锁等待队列在高频添加/移除（超时 + 唤醒）场景下，
+ *          swap-remove 逻辑不会导致 cond var 双重初始化或资源泄漏。
+ *
+ * 此测试专门针对修复 #3（pthread_cond_t 双重初始化 UB）和
+ * 修复 #5（正常唤醒路径 cond 销毁）。
+ *
+ * 运行路径 (每轮):
+ *   1 个 holder 线程: 持有 X 锁 2ms → 释放
+ *   4 个 waiter 线程: try_lock(X, timeout=5ms)
+ *     → 大部分因 X 互斥入等待队列
+ *     → holder 释放 → wake_waiters wake 1 个 → 其他人超时
+ *     → 超时路径: pthread_cond_destroy(own) + swap-remove (销毁末尾 cond)
+ *     → 唤醒路径: pthread_cond_destroy(own)
+ *     → 下一轮: add_waiter 重用槽位 → pthread_cond_init (此时 cond 已销毁)
+ *
+ * 如果 swap-remove 未正确销毁末尾 cond，下一轮的 pthread_cond_init
+ * 会对已初始化的 cond 重复 init → UB（可能在极端情况下崩溃）。
+ *
+ * 覆盖: lock_table.c treelock_table_wake_waiters() swap-remove +
+ *       client.c _do_lock_core() 超时路径 swap-remove +
+ *       client.c _do_lock_core() 正常唤醒路径 cond 销毁
+ * ========================================================================= */
+
+#define WAIT_CHURN_ROUNDS   (200)
+#define WAIT_CHURN_WAITERS  (4)
+
+typedef struct {
+    treelock_t      *tl;
+    int              thread_idx;
+    volatile int     acquired;
+    volatile int     timeouts;
+    volatile int     errors;
+    volatile int     running;  /* 控制线程启停 */
+} churn_thread_t;
+
+static void *churn_holder(void *arg) {
+    auto *ct = (churn_thread_t *)arg;
+    while (ct->running) {
+        /* 持有 X 锁一小段时间 */
+        if (treelock_lock(ct->tl, 1, TREELOCK_X) == TREELOCK_OK) {
+            /* 短暂持有，给 waiter 时间入队 */
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            treelock_unlock(ct->tl, 1);
+        }
+        /* 释放后短暂休息，让被唤醒的线程完成操作 */
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return nullptr;
+}
+
+static void *churn_waiter(void *arg) {
+    auto *ct = (churn_thread_t *)arg;
+    while (ct->running) {
+        int rc = treelock_try_lock(ct->tl, 1, TREELOCK_X, 5);
+        if (rc == TREELOCK_OK) {
+            ct->acquired++;
+            /* 立即释放，让其他 waiter 有机会 */
+            treelock_unlock(ct->tl, 1);
+        } else if (rc == TREELOCK_ERR_TIMEOUT) {
+            ct->timeouts++;
+        } else {
+            ct->errors++;
+        }
+    }
+    return nullptr;
+}
+
+/**
+ * 测试目标: 高频等待队列进出不触发 cond 双重初始化 UB
+ *
+ * 运行路径: 参见上方 "Test 10" 块注释
+ * 覆盖: lock_table.c swap-remove 末尾 cond 销毁,
+ *       client.c 超时 + 唤醒路径 cond 销毁
+ */
+TEST(Concurrent, WaitQueueChurn)
+{
+    treelock_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.timeout_ms = 5000;
+    cfg.client_id  = "churn_test";
+
+    treelock_t *tl = treelock_create(&cfg);
+    ASSERT_NE(tl, nullptr);
+
+    churn_thread_t holder_data;
+    memset(&holder_data, 0, sizeof(holder_data));
+    holder_data.tl      = tl;
+    holder_data.running = 1;
+
+    churn_thread_t waiter_data[WAIT_CHURN_WAITERS];
+    memset(waiter_data, 0, sizeof(waiter_data));
+
+    pthread_t holder_thread;
+    pthread_t waiter_threads[WAIT_CHURN_WAITERS];
+
+    /* 启动 waiter 线程 */
+    for (int t = 0; t < WAIT_CHURN_WAITERS; t++) {
+        waiter_data[t].tl         = tl;
+        waiter_data[t].thread_idx = t;
+        waiter_data[t].running    = 1;
+        pthread_create(&waiter_threads[t], nullptr, churn_waiter, &waiter_data[t]);
+    }
+
+    /* 启动 holder 线程 */
+    pthread_create(&holder_thread, nullptr, churn_holder, &holder_data);
+
+    /* 运行一段时间 */
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+    /* 停止所有线程 */
+    holder_data.running = 0;
+    for (int t = 0; t < WAIT_CHURN_WAITERS; t++) {
+        waiter_data[t].running = 0;
+    }
+
+    pthread_join(holder_thread, nullptr);
+    for (int t = 0; t < WAIT_CHURN_WAITERS; t++) {
+        pthread_join(waiter_threads[t], nullptr);
+    }
+
+    /* 统计结果 */
+    int total_acquired = 0, total_timeouts = 0, total_errors = 0;
+    for (int t = 0; t < WAIT_CHURN_WAITERS; t++) {
+        total_acquired += waiter_data[t].acquired;
+        total_timeouts += waiter_data[t].timeouts;
+        total_errors   += waiter_data[t].errors;
+    }
+
+    EXPECT_EQ(total_errors, 0)
+        << "errors in churn: acquired=" << total_acquired
+        << " timeouts=" << total_timeouts;
+
+    /* 应该有人获取到锁 */
+    EXPECT_GT(total_acquired, 0) << "no one acquired lock during churn";
+
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * Test 11: 并发创建/销毁多实例
+ *
+ * 测试目标: 多线程同时创建独立的 treelock_t 实例（含树加载）、
+ *          使用后销毁，验证 treelock_destroy 的同步屏障和树清理
+ *          回调在并发环境下不产生竞态或崩溃。
+ *
+ * 此测试针对修复 #1（destroy 同步屏障）和 #2（树索引泄露）。
+ *
+ * 运行路径 (每个线程):
+ *   treelock_create() → 分配 tl
+ *   treelock_load_tree_from_string() → 分配 tree_index + 注册节点
+ *     → tree_destroy = _tree_destroy_cb
+ *   treelock_lock_path() + treelock_unlock_path()
+ *   treelock_destroy(tl)
+ *     → treelock_unlock_all() → barrier (lock+unlock all node mutexes)
+ *     → tree_destroy(tree_data) → tree_index_destroy() + free
+ *     → 清理锁表 + mutex + free(tl)
+ *
+ * 覆盖: client.c treelock_destroy() 同步屏障 + 树清理回调,
+ *       tree_core.c tree_index_destroy() 新 hash 桶遍历
+ * ========================================================================= */
+
+#define MULTI_INSTANCE_THREADS (6)
+#define MULTI_INSTANCE_CYCLES  (30)
+
+typedef struct {
+    int thread_idx;
+    int errors;
+    int cycles;
+} multi_inst_data_t;
+
+static void *multi_instance_worker(void *arg) {
+    auto *md = (multi_inst_data_t *)arg;
+
+    const char *json =
+        "{ \"nodes\": ["
+        "  { \"id\": 1, \"label\": \"root\", \"parent\": 0 },"
+        "  { \"id\": 2, \"label\": \"sub\",  \"parent\": 1 }"
+        "]}";
+
+    for (int c = 0; c < MULTI_INSTANCE_CYCLES; c++) {
+        treelock_t *tl = treelock_create(nullptr);
+        if (!tl) { md->errors++; continue; }
+
+        if (treelock_load_tree_from_string(tl, json) != TREELOCK_OK) {
+            md->errors++;
+            treelock_destroy(tl);
+            continue;
+        }
+
+        /* lock/unlock 路径 */
+        if (treelock_lock_path(tl, "/root/sub", TREELOCK_X) != TREELOCK_OK) {
+            md->errors++;
+            treelock_destroy(tl);
+            continue;
+        }
+        if (treelock_unlock_path(tl, "/root/sub") != TREELOCK_OK) {
+            md->errors++;
+        }
+
+        /* 查询验证 */
+        EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_NL);
+        EXPECT_EQ(treelock_get_mode(tl, 2), TREELOCK_NL);
+
+        treelock_destroy(tl);
+        md->cycles++;
+    }
+    return nullptr;
+}
+
+/**
+ * 测试目标: 6 线程 × 30 次 create→load→use→destroy 周期无错误
+ *
+ * 运行路径: 参见上方 "Test 11" 块注释
+ * 覆盖: client.c treelock_destroy() 完整清理路径 (barrier + tree + mutex)
+ */
+TEST(Concurrent, MultiInstanceCreateDestroy)
+{
+    pthread_t threads[MULTI_INSTANCE_THREADS];
+    multi_inst_data_t data[MULTI_INSTANCE_THREADS];
+
+    for (int t = 0; t < MULTI_INSTANCE_THREADS; t++) {
+        memset(&data[t], 0, sizeof(data[t]));
+        data[t].thread_idx = t;
+        pthread_create(&threads[t], nullptr, multi_instance_worker, &data[t]);
+    }
+
+    int total_errors = 0, total_cycles = 0;
+    for (int t = 0; t < MULTI_INSTANCE_THREADS; t++) {
+        pthread_join(threads[t], nullptr);
+        total_errors += data[t].errors;
+        total_cycles += data[t].cycles;
+    }
+
+    EXPECT_EQ(total_errors, 0) << "errors in " << total_cycles << " create/destroy cycles";
+    EXPECT_EQ(total_cycles, MULTI_INSTANCE_THREADS * MULTI_INSTANCE_CYCLES)
+        << "all cycles should complete";
 }
