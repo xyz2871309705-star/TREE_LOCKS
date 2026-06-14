@@ -135,7 +135,7 @@ TREELOCK_LOG_ERROR("TAG", "failed: %d", code);
 
 ## Test Framework
 
-Uses **Google Test (GTest)** via `FetchContent`. Tests are written in C++ (`.cc`) and call C code under test via `extern "C"` blocks.
+Uses **Google Test (GTest)** via `FetchContent`. Tests are C++ (`.cc`) calling C code under test via `extern "C"`.
 
 ```cpp
 #include <gtest/gtest.h>
@@ -149,38 +149,34 @@ TEST(SuiteName, TestName) {
 }
 ```
 
-### Test binary → module mapping
+### 当前测试概况 (113 用例)
 
-| Binary | Links | Covers |
-|--------|-------|--------|
-| `test_protocol` | `treelock_core` | `protocol.c` |
-| `test_log` | `treelock_log`, `treelock_core` | `log_core.c` |
-| `test_concurrent` | `treelock_core`, `treelock_tree` | `client.c`, `lock_table.c` |
-| `test_tree` | `treelock_tree` | `tree_*.c` |
+| 二进制 | 用例数 | 覆盖模块 | 密度 |
+|--------|--------|---------|------|
+| `test_protocol` | 30 | `protocol.c` + 压力/死锁/内存 | — |
+| `test_log` | 15 | `log_core.c` | 15.0/KLOC ✅ |
+| `test_concurrent` | 27 | `client.c`, `lock_table.c` | — |
+| `test_tree` | 41 | `tree_*.c` (5 files) | 15.2/KLOC ✅ |
+| **合计** | **113** | — | **16.9/KLOC** |
 
-### Testing Rules (mandatory)
+### 测试规范 (强制)
 
-1. **每一个对外 API 必须有专属测试**：新增/修改 `treelock_*.h` 中的任何公开函数，必须在对应测试文件中添加至少一个直接调用该 API 的 `TEST()` 用例。
+1. **每 API 必有专属测试** — 新增 `treelock_*.h` 公开函数 → 至少 1 个 `TEST()` 直接调用
+2. **每 API 必有关联测试** — API 间协作链 (如 `lock_path` → `resolve` + `lock` + `validate`) 必须覆盖
+3. **新模块 ≥ 15 用例/KLOC** — `MIN = ceil(源码行数/1000) × 15`
+4. **测试注释** — 每个 `TEST()` 上方须有 `目标/路径/覆盖` 块注释
+5. **修改代码同步 TEST_STRATEGY.md** — 增删改用例必须更新文档计数
 
-2. **每一个对外 API 必须有关联测试**：API 之间如果有协作（如 `lock_path` 依赖 `lock`+`resolve_path`），必须添加验证协作链的测试用例。
+### 测试类别覆盖
 
-3. **新增模块的测试密度 ≥ 15 用例/KLOC**：
-   - 添加新模块（如新的 `treelock_*` 子目录）时，按模块源码行数（`.c` + `.h`，不含第三方库）计算最低测试用例数。
-   - 公式：`MIN_TESTS = ceil(total_lines / 1000) × 15`
-   - 各模块当前达标情况：
-
-   | 模块 | 源码行数 | 测试用例 | 密度 | 状态 |
-   |------|---------|---------|------|------|
-   | `treelock_log` | ~1.0K | 15 | 15.0 | ✅ |
-   | `treelock_core` | ~3.0K | 31 (19 + 12) | 10.3 | ⚠️ 待补充 |
-   | `treelock_tree` | ~2.7K | 29 | 10.7 | ⚠️ 待补充 |
-
-4. **测试文件注释规范**：每个 `TEST()` 上方必须有一个 `/** … */` 块注释，说明：
-   - `测试目标：` — 验证什么
-   - `运行路径：` — 关键函数调用链
-   - `覆盖：` — 具体 `.c` 文件和函数
-
-5. **修改代码必须同步更新 `docs/TEST_STRATEGY.md`**：新增/删除/改名测试用例时，同步更新该文档中的用例清单和计数。
+| 类别 | 覆盖 | 示例 |
+|------|------|------|
+| 协议纯逻辑 | ✅ 100% | 兼容矩阵全 36 组合、升降级全路径 |
+| API 参数校验 | ✅ | NULL/destroyed/非法 mode |
+| 并发安全性 | ✅ | 8 线程共享实例、死锁预防 |
+| 内存管理 | ✅ | 100 周期 create/destroy、数组回缩 |
+| 压力 | ✅ | 1M 查询、1K 升降级循环、1.5s 队列 churn |
+| 树操作 | ✅ | 文件/字符串加载、10 层嵌套、100 节点 |
 
 ## Key Design Decisions
 
