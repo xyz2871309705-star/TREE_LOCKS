@@ -255,10 +255,17 @@ static RET_CODE _do_lock_core(
     }
 
     /* ── 2. 已持有检查与升级 ── */
+    /*
+     * is_new_lock 标记：TRUE = 全新获取锁，FALSE = 从已有模式升级。
+     * 用于步骤 4 中决定是否启用并发重复授予检查。
+     * 升级路径不应跳过 grant，因为旧周期的 grant 可能残留。
+     */
+    INT_32 is_new_lock = TRUE;
     {
         treelock_mode_t existing_mode;
         rc = _get_held_mode(tl, node_id, &existing_mode);
         if (rc == TREELOCK_OK) {
+            is_new_lock = FALSE;
             /* 已持有相同模式 → 增加引用计数（支持重入） */
             if (existing_mode == mode) {
                 pthread_mutex_lock(&tl->held_mutex);
@@ -428,6 +435,99 @@ static RET_CODE _do_lock_core(
                 treelock_mode_name(mode), cid);
         }
     } else {
+        /*
+         * ── 防竞争重复授予检查（仅全新锁，不含 escalate）──
+         *
+         * 竞争窗口：_get_held_mode() (步骤 2) 与 _add_held_lock() (步骤 6)
+         * 之间，另一个线程可能已为同一 (client_id, mode) 授予了锁。
+         * 若直接 grant_lock，将导致 grant 列表中出现重复条目，
+         * 进而第一个线程 unlock 时释放 grant，第二个线程 unlock
+         * 时找不到 grant → TREELOCK_ERR_INVAL。
+         *
+         * 限制 is_new_lock 范围：escalate 场景下 grant 列表中可能有
+         * 旧周期残留的同模式记录（如 lock→escalate→unlock→lock 后
+         * grant 已清空但仍有其他模式），不应跳过授予。
+         *
+         * 修复：在 node->mutex 保护下扫描 grant 列表，若发现已有
+         * 匹配条目则跳过授予，仅处理 held_locks 引用计数。
+         */
+        if (is_new_lock) {
+            UINT_64 gi;
+            INT_32  already_granted = FALSE;
+            for (gi = 0; gi < node->grant_count; gi++) {
+                if (strcmp(node->grants[gi].client_id, cid) == EQUAL &&
+                    node->grants[gi].mode == mode) {
+                    already_granted = TRUE;
+                    break;
+                }
+            }
+
+            if (already_granted) {
+                /* 并发线程已授予 → 释放 node->mutex 后补建 held 引用 */
+                pthread_mutex_unlock(&node->mutex);
+
+                /*
+                 * 补充 held_locks 引用：并发线程可能尚未调用
+                 * _add_held_lock（仍在 node->mutex 临界区内），
+                 * 也可能已经调用。同时处理两种情况。
+                 */
+                pthread_mutex_lock(&tl->held_mutex);
+                {
+                    treelock_held_lock_t *held = _find_held_lock(tl, node_id);
+                    if (held != NULL && held->mode == mode) {
+                        /* 并发线程已完成 _add_held_lock → 仅增引用 */
+                        held->ref_count++;
+                        TREELOCK_LOG_DEBUG("CORE",
+                            "lock re-entrant (concurrent grant): "
+                            "node=%llu mode=%s ref=%u client=%s",
+                            (unsigned long long)node_id,
+                            treelock_mode_name(mode),
+                            (unsigned int)(held->ref_count), cid);
+                    } else {
+                        /*
+                         * 并发线程尚未完成 _add_held_lock 或 held
+                         * entry 不存在 → 代为创建 held 记录。
+                         * 不能调用 _add_held_lock (会重复获取 held_mutex)，
+                         * 内联其逻辑。
+                         */
+                        if (tl->held_count >= tl->held_capacity) {
+                            UINT_64 new_cap;
+                            treelock_held_lock_t *new_h;
+                            new_cap = (tl->held_capacity == 0)
+                                      ? TREELOCK_HELD_INIT_CAP
+                                      : tl->held_capacity * 2;
+                            new_h = (treelock_held_lock_t *)realloc(
+                                tl->held_locks,
+                                (size_t)(new_cap * sizeof(treelock_held_lock_t)));
+                            if (new_h != NULL) {
+                                tl->held_locks    = new_h;
+                                tl->held_capacity = new_cap;
+                            }
+                        }
+                        if (tl->held_count < tl->held_capacity) {
+                            tl->held_locks[tl->held_count].node_id     = node_id;
+                            tl->held_locks[tl->held_count].mode        = mode;
+                            tl->held_locks[tl->held_count].acquired_at = _current_time_ms();
+                            tl->held_locks[tl->held_count].ref_count   = 1;
+                            tl->held_count++;
+                            TREELOCK_LOG_DEBUG("CORE",
+                                "lock held (concurrent grant): "
+                                "node=%llu mode=%s client=%s",
+                                (unsigned long long)node_id,
+                                treelock_mode_name(mode), cid);
+                        }
+                    }
+                }
+                pthread_mutex_unlock(&tl->held_mutex);
+
+                TREELOCK_LOG_DEBUG("CORE",
+                    "lock acquired (via concurrent): node=%llu mode=%s client=%s",
+                    (unsigned long long)node_id,
+                    treelock_mode_name(mode), cid);
+                return TREELOCK_OK;
+            }
+        }
+
         /* 无冲突 → 直接授予 */
         TREELOCK_LOG_TRACE("CORE",
             "direct grant: node=%llu mode=%s client=%s",
@@ -760,10 +860,18 @@ RET_CODE treelock_unlock(
                            (unsigned long long)node_id,
                            treelock_mode_name(held_mode), cid);
     } else {
-        TREELOCK_LOG_WARN("CORE",
-            "unlock release failed: node=%llu mode=%s client=%s rc=%d",
+        /*
+         * grant 未找到：可能是并发线程已经代为释放（竞争窗口）。
+         * 仍须清理 held entry，否则残留的悬空引用会导致后续
+         * _get_held_mode 误判为仍持有锁。
+         */
+        TREELOCK_LOG_DEBUG("CORE",
+            "lock already released by concurrent thread: "
+            "node=%llu mode=%s client=%s",
             (unsigned long long)node_id,
-            treelock_mode_name(held_mode), cid, rc);
+            treelock_mode_name(held_mode), cid);
+        _remove_held_lock(tl, node_id);
+        rc = TREELOCK_OK;
     }
 
     return rc;
