@@ -885,6 +885,8 @@ TEST(MemoryTest, RepeatedCreateLockDestroy100)
         EXPECT_EQ(treelock_unlock_path(tl, "/a/b"), TREELOCK_OK);
 
         EXPECT_EQ(treelock_lock_path(tl, "/c", TREELOCK_S), TREELOCK_OK);
+        /* escalate 目标节点前需先升级根节点（S→SIX 要求父节点持有 IX 或更强） */
+        EXPECT_EQ(treelock_escalate(tl, 1, TREELOCK_IX), TREELOCK_OK);
         /* escalate + downgrade on target node */
         EXPECT_EQ(treelock_escalate(tl, 4, TREELOCK_SIX), TREELOCK_OK);
         EXPECT_EQ(treelock_downgrade(tl, 4, TREELOCK_IS), TREELOCK_OK);

@@ -340,8 +340,8 @@ static RET_CODE _do_lock_core(
             return rc;
         }
 
-        /* 获取刚加入的等待条目 */
-        entry = &node->wait_queue[node->wait_count - 1];
+        /* 获取刚加入的等待条目（指针） */
+        entry = node->wait_queue[node->wait_count - 1];
 
         if (timeout_ms > 0) {
             /* ── 带超时等待 ── */
@@ -356,25 +356,13 @@ static RET_CODE _do_lock_core(
                 /* 超时：从等待队列中移除自身 */
                 UINT_64 j;
                 for (j = 0; j < node->wait_count; j++) {
-                    if (&node->wait_queue[j] == entry) {
+                    if (node->wait_queue[j] == entry) {
                         pthread_cond_destroy(&entry->cond);
-                        /* swap-remove：销毁末尾 cond 后逐字段拷贝数据 */
+                        free(entry);
+                        /* swap-remove：移动最后一个指针到位置 j */
                         if (j < node->wait_count - 1) {
-                            /*
-                             * 销毁末尾条目的 cond —— 其数据将被拷贝到位置 j，
-                             * 原 cond 不再被任何 waiter 使用，避免下次
-                             * add_waiter 重复 pthread_cond_init（UB）。
-                             */
-                            pthread_cond_destroy(
-                                &node->wait_queue[node->wait_count - 1].cond);
-                            memcpy(node->wait_queue[j].client_id,
-                                   node->wait_queue[node->wait_count - 1].client_id,
-                                   TREELOCK_CLIENT_ID_MAX);
-                            node->wait_queue[j].requested_mode =
-                                node->wait_queue[node->wait_count - 1].requested_mode;
-                            node->wait_queue[j].enqueue_time =
-                                node->wait_queue[node->wait_count - 1].enqueue_time;
-                            /* cond 不拷贝：保留位置 j 原有的 cond 供后续使用 */
+                            node->wait_queue[j] =
+                                node->wait_queue[node->wait_count - 1];
                         }
                         node->wait_count--;
                         break;
@@ -414,8 +402,23 @@ static RET_CODE _do_lock_core(
                 }
             }
             if (!granted) {
-                /* 未能获取锁 → 销毁自己的 cond 并返回错误 */
+                /*
+                 * 未能获取锁（spurious wake 后 grant 已被他人抢占）。
+                 * 从等待队列中移除自身，销毁 cond 并释放条目。
+                 */
+                UINT_64 j;
+                for (j = 0; j < node->wait_count; j++) {
+                    if (node->wait_queue[j] == entry) {
+                        if (j < node->wait_count - 1) {
+                            node->wait_queue[j] =
+                                node->wait_queue[node->wait_count - 1];
+                        }
+                        node->wait_count--;
+                        break;
+                    }
+                }
                 pthread_cond_destroy(&entry->cond);
+                free(entry);
                 pthread_mutex_unlock(&node->mutex);
                 TREELOCK_LOG_WARN("CORE",
                     "lock stale after wake: node=%llu mode=%s client=%s",
@@ -424,11 +427,12 @@ static RET_CODE _do_lock_core(
                 return TREELOCK_ERR_STALE;
             }
             /*
-             * 成功获取锁 → 销毁自己的 cond。
+             * 成功获取锁 → 销毁自己的 cond 并释放条目。
              * wake_waiters 已将本条目 swap-remove 出队列，
-             * 此 cond 不再被任何人使用。
+             * entry 不再被队列引用。
              */
             pthread_cond_destroy(&entry->cond);
+            free(entry);
             TREELOCK_LOG_TRACE("CORE",
                 "woken and granted: node=%llu mode=%s client=%s",
                 (unsigned long long)node_id,
@@ -515,6 +519,22 @@ static RET_CODE _do_lock_core(
                                 "node=%llu mode=%s client=%s",
                                 (unsigned long long)node_id,
                                 treelock_mode_name(mode), cid);
+                        } else {
+                            /*
+                             * 致命错误：realloc 失败且数组已满，
+                             * 无法记录 held entry。锁表中 grant 已存在，
+                             * 但客户端无法追踪该锁。
+                             * 保守策略：返回错误而非静默丢失追踪记录。
+                             */
+                            TREELOCK_LOG_ERROR("CORE",
+                                "FATAL: cannot record held lock after concurrent grant: "
+                                "node=%llu mode=%s client=%s (held_count=%llu capacity=%llu)",
+                                (unsigned long long)node_id,
+                                treelock_mode_name(mode), cid,
+                                (unsigned long long)tl->held_count,
+                                (unsigned long long)tl->held_capacity);
+                            pthread_mutex_unlock(&tl->held_mutex);
+                            return TREELOCK_ERR_INVAL;
                         }
                     }
                 }
@@ -688,10 +708,11 @@ VOID treelock_destroy(
             free(cleanup_node->grants);
             cleanup_node->grants = NULL;
 
-            /* 销毁等待队列中的所有条件变量（含 swap-remove 残留的） */
-            for (i = 0; i < cleanup_node->wait_capacity; i++) {
+            /* 销毁等待队列中已初始化的条目（仅 wait_count 个已使用） */
+            for (i = 0; i < cleanup_node->wait_count; i++) {
                 pthread_cond_destroy(
-                    &cleanup_node->wait_queue[i].cond);
+                    &cleanup_node->wait_queue[i]->cond);
+                free(cleanup_node->wait_queue[i]);
             }
             free(cleanup_node->wait_queue);
             cleanup_node->wait_queue = NULL;
@@ -861,16 +882,40 @@ RET_CODE treelock_unlock(
                            treelock_mode_name(held_mode), cid);
     } else {
         /*
-         * grant 未找到：可能是并发线程已经代为释放（竞争窗口）。
-         * 仍须清理 held entry，否则残留的悬空引用会导致后续
-         * _get_held_mode 误判为仍持有锁。
+         * grant 未找到：可能是并发 escalate 已经代为释放了旧模式。
+         * 必须重新检查 held entry 的模式是否已变更：
+         * - 若 mode 已变（escalate 更新了 held entry）→ 不删除，返回 OK
+         * - 若 mode 未变（其他原因）→ 清理悬空 held entry
          */
-        TREELOCK_LOG_DEBUG("CORE",
-            "lock already released by concurrent thread: "
-            "node=%llu mode=%s client=%s",
-            (unsigned long long)node_id,
-            treelock_mode_name(held_mode), cid);
-        _remove_held_lock(tl, node_id);
+        BOOL should_remove = TRUE;
+        pthread_mutex_lock(&tl->held_mutex);
+        {
+            treelock_held_lock_t *held = _find_held_lock(tl, node_id);
+            if (held != NULL && held->mode != held_mode) {
+                /*
+                 * escalate 已将 held entry 从 old_mode 更新为 new_mode，
+                 * 此次 unlock 对应的是已被 escalate 替换的旧锁周期。
+                 * 不删除 held entry —— 它现在代表了 escalate 后的新模式。
+                 */
+                should_remove = FALSE;
+                TREELOCK_LOG_DEBUG("CORE",
+                    "lock mode changed by escalate: node=%llu "
+                    "unlock_mode=%s held_mode=%s client=%s — skip held removal",
+                    (unsigned long long)node_id,
+                    treelock_mode_name(held_mode),
+                    treelock_mode_name(held->mode), cid);
+            }
+        }
+        pthread_mutex_unlock(&tl->held_mutex);
+
+        if (should_remove) {
+            TREELOCK_LOG_DEBUG("CORE",
+                "lock already released by concurrent thread: "
+                "node=%llu mode=%s client=%s",
+                (unsigned long long)node_id,
+                treelock_mode_name(held_mode), cid);
+            _remove_held_lock(tl, node_id);
+        }
         rc = TREELOCK_OK;
     }
 
@@ -986,6 +1031,16 @@ RET_CODE treelock_escalate(
 
     if (!treelock_escalate_valid(old_mode, new_mode)) {
         return TREELOCK_ERR_PROTOCOL;
+    }
+
+    /*
+     * 协议校验（树结构管理）：
+     * 升级可能改变子节点锁模式，从而改变对父节点锁的要求。
+     * 例如 IS→X：子节点 IS 只需父节点 IS，但子节点 X 需要父节点 IX。
+     */
+    rc = treelock_validate_protocol(tl, node_id, new_mode);
+    if (rc != TREELOCK_OK) {
+        return rc;
     }
 
     cid = (tl->config.client_id != NULL) ? tl->config.client_id : "local";
