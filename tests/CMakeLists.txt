@@ -32,7 +32,7 @@ function(treelock_add_test TEST_NAME TEST_SOURCE)
 endfunction()
 
 # ── 测试: 协议正确性 ──
-treelock_add_test(test_protocol test_protocol.cc treelock_core)
+treelock_add_test(test_protocol test_protocol.cc treelock_core treelock_tree)
 
 # ── 测试: 日志模块 ──
 treelock_add_test(test_log test_log.cc treelock_log treelock_core)

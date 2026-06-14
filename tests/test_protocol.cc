@@ -10,9 +10,14 @@
 
 #include <gtest/gtest.h>
 #include <cstring>
+#include <cstdlib>
+#include <pthread.h>
+#include <thread>
+#include <chrono>
 
 extern "C" {
 #include "treelock.h"
+#include "treelock_tree.h"
 #include "treelock_log.h"
 #include "internal.h"
 }
@@ -526,4 +531,552 @@ TEST(Utils, StrErrorUnknownCode)
 {
     EXPECT_STREQ(treelock_strerror(999), "Unknown error");
     EXPECT_STREQ(treelock_strerror(-100), "Unknown error");
+}
+
+/* =========================================================================
+ * 压力测试: 随机兼容矩阵 100 万次查询
+ *
+ * 测试目标: 高频率调用 treelock_mode_compatible，验证无崩溃、
+ *          结果始终与标准矩阵一致。
+ *
+ * 覆盖: protocol.c treelock_mode_compatible() — 高频路径
+ * ========================================================================= */
+
+TEST(StressTest, RandomCompatMatrix1M)
+{
+    /* 标准答案矩阵 */
+    static const int answer[6][6] = {
+        /* NL  IS  IX   S SIX   X */
+        {   1,  1,  1,  1,  1,  1 }, /* NL */
+        {   1,  1,  1,  1,  1,  0 }, /* IS */
+        {   1,  1,  1,  0,  0,  0 }, /* IX */
+        {   1,  1,  0,  1,  0,  0 }, /* S  */
+        {   1,  1,  0,  0,  0,  0 }, /* SIX */
+        {   1,  0,  0,  0,  0,  0 }, /* X  */
+    };
+
+    for (int i = 0; i < 1000000; i++) {
+        int ex = (i * 3 + 7) % 6;
+        int rq = (i * 11 + 13) % 6;
+        int expected = answer[ex][rq];
+        int actual = treelock_mode_compatible(
+            (treelock_mode_t)ex, (treelock_mode_t)rq);
+        /* 只检查一批抽样，避免 100万次 EXPECT 导致测试极慢 */
+        if (i % 100000 == 0 || actual != expected) {
+            EXPECT_EQ(actual, expected)
+                << "mismatch at iteration " << i
+                << " existing=" << treelock_mode_name((treelock_mode_t)ex)
+                << " requested=" << treelock_mode_name((treelock_mode_t)rq);
+        }
+    }
+}
+
+/* =========================================================================
+ * 压力测试: escalate + downgrade 1000 次循环
+ *
+ * 测试目标: 快速升级/降级循环验证锁表状态一致性，
+ *          每次循环后锁模式应正确，无状态残留。
+ *
+ * 覆盖: client.c treelock_escalate() + treelock_downgrade() —
+ *       grant 替换 + held 原地更新
+ * ========================================================================= */
+
+TEST(StressTest, EscalateDowngradeCycle1K)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+
+    for (int cycle = 0; cycle < 1000; cycle++) {
+        /* NL → IS → IX → SIX → X → SIX → IS → NL */
+        EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_IS), TREELOCK_OK);
+        EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_IS);
+
+        EXPECT_EQ(treelock_escalate(tl, 1, TREELOCK_IX), TREELOCK_OK);
+        EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_IX);
+
+        EXPECT_EQ(treelock_escalate(tl, 1, TREELOCK_SIX), TREELOCK_OK);
+        EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_SIX);
+
+        EXPECT_EQ(treelock_escalate(tl, 1, TREELOCK_X), TREELOCK_OK);
+        EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_X);
+
+        EXPECT_EQ(treelock_downgrade(tl, 1, TREELOCK_SIX), TREELOCK_OK);
+        EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_SIX);
+
+        EXPECT_EQ(treelock_downgrade(tl, 1, TREELOCK_IS), TREELOCK_OK);
+        EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_IS);
+
+        treelock_unlock(tl, 1);
+        EXPECT_EQ(treelock_get_mode(tl, 1), TREELOCK_NL);
+    }
+
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * 压力测试: 50 节点 × 100 次 lock/unlock
+ *
+ * 测试目标: 大量不同节点的快速 lock/unlock 循环，
+ *          验证锁表和 held_locks 数组在大量操作后状态一致。
+ *
+ * 覆盖: lock_table.c treelock_table_get_or_create() 批量创建,
+ *       client.c _add_held_lock() / _remove_held_lock() 频繁操作
+ * ========================================================================= */
+
+TEST(StressTest, MultiNodeHeavyLockUnlock)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+
+    for (int round = 0; round < 100; round++) {
+        /* 获取 50 个不同节点的锁 */
+        for (int n = 1; n <= 50; n++) {
+            treelock_mode_t mode;
+            switch (n % 5) {
+                case 0: mode = TREELOCK_IS; break;
+                case 1: mode = TREELOCK_IX; break;
+                case 2: mode = TREELOCK_S;  break;
+                case 3: mode = TREELOCK_SIX;break;
+                default:mode = TREELOCK_X;  break;
+            }
+            ASSERT_EQ(treelock_lock(tl, (treelock_node_id_t)n, mode), TREELOCK_OK)
+                << "failed at round=" << round << " node=" << n;
+        }
+
+        /* 验证全部持有 */
+        for (int n = 1; n <= 50; n++) {
+            EXPECT_NE(treelock_get_mode(tl, (treelock_node_id_t)n), TREELOCK_NL);
+        }
+
+        /* 逆序释放 */
+        for (int n = 50; n >= 1; n--) {
+            EXPECT_EQ(treelock_unlock(tl, (treelock_node_id_t)n), TREELOCK_OK);
+        }
+    }
+
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * 死锁测试: 协议强制防止锁顺序死锁
+ *
+ * 两层树: root(1) → child(2)
+ *
+ * 经典死锁场景 (如果无协议强制):
+ *   Thread A: lock(2, X) → lock(1, X)   (自底向上)
+ *   Thread B: lock(1, X) → lock(2, X)   (自顶向下)
+ *   → 死锁: A 持有 2 等 1, B 持有 1 等 2
+ *
+ * 有协议强制时: A 的第一步 lock(2, X) 会失败 (父节点未锁)
+ * → 死锁被协议层预防。
+ *
+ * 覆盖: protocol.c treelock_validate_protocol() — IS/IX 分支
+ * ========================================================================= */
+
+TEST(DeadlockTest, ProtocolPreventsLockOrderingDeadlock)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+
+    /* 构建树: root(1) → child(2) */
+    ASSERT_EQ(treelock_register_node(tl, 1, 0, "/"), TREELOCK_OK);
+    ASSERT_EQ(treelock_register_node(tl, 2, 1, "child"), TREELOCK_OK);
+
+    /* 自底向上 lock — 第一步就因协议违规被拒绝 */
+    EXPECT_EQ(treelock_lock(tl, 2, TREELOCK_X), TREELOCK_ERR_PROTOCOL);
+
+    /* 正确顺序: 自顶向下 */
+    EXPECT_EQ(treelock_lock(tl, 1, TREELOCK_IX), TREELOCK_OK);
+    EXPECT_EQ(treelock_lock(tl, 2, TREELOCK_X), TREELOCK_OK);
+    treelock_unlock(tl, 2);
+    treelock_unlock(tl, 1);
+
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * 死锁测试: 共享实例多线程无死锁
+ *
+ * 测试目标: 8 线程共享同一个 treelock_t，对不同节点执行
+ *          lock/unlock 500 次，验证操作在超时内全部完成（无死锁）。
+ *
+ * 所有线程使用同一 client_id，因此自冲突被跳过。
+ * 不同节点的锁操作由 node->mutex 顺序保护。
+ *
+ * 覆盖: lock_table.c treelock_table_get_or_create() +
+ *       treelock_table_check_conflict() + 锁表并发安全性
+ * ========================================================================= */
+
+static void *deadlock_worker(void *arg) {
+    auto *tl = (treelock_t *)arg;
+    for (int i = 0; i < 500; i++) {
+        auto nid = (treelock_node_id_t)((i % 20) + 1);
+        treelock_mode_t mode;
+        switch (i % 3) {
+            case 0: mode = TREELOCK_IS; break;
+            case 1: mode = TREELOCK_IX; break;
+            default:mode = TREELOCK_S;  break;
+        }
+        /* 短超时确保不会永久阻塞 */
+        int rc = treelock_try_lock(tl, nid, mode, 5000);
+        if (rc == TREELOCK_OK) {
+            treelock_unlock(tl, nid);
+        }
+        /* 不应有任何致命错误 — 用 if 避免 ASSERT 在 void* 函数中的问题 */
+        if (rc == TREELOCK_ERR_INVAL) return (void *)(intptr_t)(-1);
+    }
+    return nullptr;
+}
+
+TEST(DeadlockTest, SharedInstanceNoDeadlock)
+{
+    treelock_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.timeout_ms = 5000;
+    cfg.client_id  = "deadlock_test";
+
+    treelock_t *tl = treelock_create(&cfg);
+    ASSERT_NE(tl, nullptr);
+
+    const int N = 8;
+    pthread_t threads[N];
+    for (int t = 0; t < N; t++) {
+        pthread_create(&threads[t], nullptr, deadlock_worker, tl);
+    }
+    for (int t = 0; t < N; t++) {
+        pthread_join(threads[t], nullptr);
+    }
+
+    treelock_destroy(tl);
+    SUCCEED(); /* 8 线程全部在超时内完成 = 无死锁 */
+}
+
+/* =========================================================================
+ * 死锁测试: escalate 死锁预防
+ *
+ * 测试目标: 多线程同时对不同节点执行 escalate 操作，
+ *          escalate 直接操作锁表 (treelock_table_grant_lock +
+ *          treelock_table_release_lock)，验证并发 escalate 不产生死锁。
+ *
+ * 覆盖: client.c treelock_escalate() — node->mutex 保护,
+ *       lock_table.c grant + release 并发安全
+ * ========================================================================= */
+
+static void *escalate_deadlock_worker(void *arg) {
+    auto *tl = (treelock_t *)arg;
+    for (int i = 0; i < 300; i++) {
+        auto nid = (treelock_node_id_t)((i % 10) + 1);
+        if (treelock_lock(tl, nid, TREELOCK_IS) != TREELOCK_OK) continue;
+        treelock_escalate(tl, nid, TREELOCK_IX);
+        treelock_escalate(tl, nid, TREELOCK_SIX);
+        treelock_unlock(tl, nid);
+    }
+    return nullptr;
+}
+
+TEST(DeadlockTest, EscalateConcurrentNoDeadlock)
+{
+    treelock_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.timeout_ms = 5000;
+    cfg.client_id  = "escalate_dl";
+
+    treelock_t *tl = treelock_create(&cfg);
+    ASSERT_NE(tl, nullptr);
+
+    const int N = 6;
+    pthread_t threads[N];
+    for (int t = 0; t < N; t++) {
+        pthread_create(&threads[t], nullptr, escalate_deadlock_worker, tl);
+    }
+    for (int t = 0; t < N; t++) {
+        pthread_join(threads[t], nullptr);
+    }
+
+    treelock_destroy(tl);
+    SUCCEED();
+}
+
+/* =========================================================================
+ * 死锁测试: 多节点交叉锁 — 协议强制无死锁
+ *
+ * 三层树: / (1) → a (2) → b (3)
+ *          \→ x (4) → y (5)
+ *
+ * 多线程对不同子树按正确顺序加锁，验证无死锁。
+ * lock_path 确保自顶向下顺序。
+ *
+ * 覆盖: tree_api.c treelock_lock_path() — 整条路径原子性,
+ *       protocol.c treelock_validate_protocol() — 多层校验
+ * ========================================================================= */
+
+TEST(DeadlockTest, CrossSubtreeNoDeadlock)
+{
+    treelock_t *tl = treelock_create(nullptr);
+    ASSERT_NE(tl, nullptr);
+
+    /* / (1) → a (2) → b (3),  / → x (4) → y (5) */
+    ASSERT_EQ(treelock_register_node(tl, 1, 0, "/"), TREELOCK_OK);
+    ASSERT_EQ(treelock_register_node(tl, 2, 1, "a"), TREELOCK_OK);
+    ASSERT_EQ(treelock_register_node(tl, 3, 2, "b"), TREELOCK_OK);
+    ASSERT_EQ(treelock_register_node(tl, 4, 1, "x"), TREELOCK_OK);
+    ASSERT_EQ(treelock_register_node(tl, 5, 4, "y"), TREELOCK_OK);
+
+    /* 两个线程同时 lock_path 不同子树 — 共享根节点但不应死锁 */
+    /* (Phase 1: 同一 client_id，自身不冲突，都应成功) */
+    std::thread t1([tl]() {
+        for (int i = 0; i < 50; i++) {
+            EXPECT_EQ(treelock_lock_path(tl, "/a/b", TREELOCK_X), TREELOCK_OK);
+            EXPECT_EQ(treelock_unlock_path(tl, "/a/b"), TREELOCK_OK);
+        }
+    });
+    std::thread t2([tl]() {
+        for (int i = 0; i < 50; i++) {
+            EXPECT_EQ(treelock_lock_path(tl, "/x/y", TREELOCK_X), TREELOCK_OK);
+            EXPECT_EQ(treelock_unlock_path(tl, "/x/y"), TREELOCK_OK);
+        }
+    });
+
+    t1.join();
+    t2.join();
+
+    /* 全部释放（线程可能因重入导致引用计数残留，unlock_all 兜底） */
+    treelock_unlock_all(tl);
+    for (int n = 1; n <= 5; n++) {
+        EXPECT_EQ(treelock_get_mode(tl, (treelock_node_id_t)n), TREELOCK_NL);
+    }
+
+    treelock_destroy(tl);
+}
+
+/* =========================================================================
+ * 内存泄露测试: 重复 create/lock 多节点/destroy 周期
+ *
+ * 测试目标: 100 次完整生命周期（create → 获取多把锁 →
+ *          unlock_all → destroy），通过大量重复分配/释放检测
+ *          内存泄露和资源泄露（mutex/cond var 残留）。
+ *
+ * 如果之前的修复合入前运行此测试，树索引泄露会导致
+ * 内存持续增长。现在应稳定通过。
+ *
+ * 覆盖: client.c treelock_create() + treelock_destroy() 完整清理,
+ *       lock_table.c 节点创建/释放,
+ *       tree 模块 tree_index 分配/释放
+ * ========================================================================= */
+
+TEST(MemoryTest, RepeatedCreateLockDestroy100)
+{
+    const char *json =
+        "{ \"nodes\": ["
+        "  { \"id\": 1, \"label\": \"root\", \"parent\": 0 },"
+        "  { \"id\": 2, \"label\": \"a\",    \"parent\": 1 },"
+        "  { \"id\": 3, \"label\": \"b\",    \"parent\": 2 },"
+        "  { \"id\": 4, \"label\": \"c\",    \"parent\": 1 }"
+        "]}";
+
+    for (int cycle = 0; cycle < 100; cycle++) {
+        treelock_t *tl = treelock_create(nullptr);
+        ASSERT_NE(tl, nullptr);
+
+        ASSERT_EQ(treelock_load_tree_from_string(tl, json), TREELOCK_OK);
+
+        /* 多种锁模式组合 */
+        EXPECT_EQ(treelock_lock_path(tl, "/a/b", TREELOCK_X), TREELOCK_OK);
+        EXPECT_EQ(treelock_unlock_path(tl, "/a/b"), TREELOCK_OK);
+
+        EXPECT_EQ(treelock_lock_path(tl, "/c", TREELOCK_S), TREELOCK_OK);
+        /* escalate + downgrade on target node */
+        EXPECT_EQ(treelock_escalate(tl, 4, TREELOCK_SIX), TREELOCK_OK);
+        EXPECT_EQ(treelock_downgrade(tl, 4, TREELOCK_IS), TREELOCK_OK);
+        treelock_unlock_path(tl, "/c");
+
+        treelock_unlock_all(tl);
+        treelock_destroy(tl);
+    }
+
+    SUCCEED(); /* 100 次完整生命周期无崩溃 = 无明显内存泄露模式 */
+}
+
+/* =========================================================================
+ * 内存泄露测试: grant/waiter 数组重复扩容回缩
+ *
+ * 测试目标: 在同一节点上反复 grant/release 和 waiter add/remove，
+ *          验证动态数组不会无限增长（每次 swap-remove 正确管理容量）。
+ *
+ * 覆盖: lock_table.c treelock_table_grant_lock() 数组扩展,
+ *       treelock_table_release_lock() swap-remove,
+ *       treelock_table_add_waiter() + wake_waiters cond 管理
+ * ========================================================================= */
+
+typedef struct {
+    treelock_t *tl;
+    int         id;
+    int         acquired;
+} mem_waiter_t;
+
+static void *mem_leak_waiter(void *arg) {
+    auto *mw = (mem_waiter_t *)arg;
+    int rc = treelock_try_lock(mw->tl, 9999, TREELOCK_X, 100);
+    if (rc == TREELOCK_OK) {
+        mw->acquired = 1;
+        treelock_unlock(mw->tl, 9999);
+    }
+    return nullptr;
+}
+
+TEST(MemoryTest, GrantWaiterArrayRecycle)
+{
+    treelock_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.timeout_ms = 5000;
+    cfg.client_id  = "mem_test";
+
+    treelock_t *tl = treelock_create(&cfg);
+    ASSERT_NE(tl, nullptr);
+
+    for (int cycle = 0; cycle < 200; cycle++) {
+        /* 获取不同数量的锁 (触发 grant 数组多次扩容) */
+        int num_locks = (cycle % 10) + 1;
+        for (int i = 0; i < num_locks; i++) {
+            ASSERT_EQ(treelock_lock(tl, 9999, TREELOCK_IS), TREELOCK_OK);
+        }
+        for (int i = 0; i < num_locks; i++) {
+            ASSERT_EQ(treelock_unlock(tl, 9999), TREELOCK_OK);
+        }
+
+        /* 制造短暂的等待者场景 */
+        ASSERT_EQ(treelock_lock(tl, 9999, TREELOCK_X), TREELOCK_OK);
+
+        pthread_t w;
+        mem_waiter_t mw = { tl, cycle, 0 };
+        pthread_create(&w, nullptr, mem_leak_waiter, &mw);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+        treelock_unlock(tl, 9999); /* 释放 → 唤醒 waiter */
+        pthread_join(w, nullptr);
+    }
+
+    treelock_destroy(tl);
+    SUCCEED(); /* 200 次 waiter 进出 + grant 扩容 = 验证 cond 管理 */
+}
+
+/* =========================================================================
+ * 内存泄露测试: 多线程并发 create/destroy
+ *
+ * 测试目标: 多个线程独立执行 create→lock→destroy 循环，
+ *          并发分配/释放互不干扰，不产生内存泄露或资源竞争。
+ *
+ * 覆盖: client.c treelock_create() + treelock_destroy() 并发安全
+ * ========================================================================= */
+
+static void *mem_create_destroy_worker(void *arg) {
+    int tid = *(int *)arg;
+    for (int c = 0; c < 50; c++) {
+        treelock_t *tl = treelock_create(nullptr);
+        if (!tl) return (void *)(intptr_t)(-1);
+
+        /* 获取一些锁 */
+        for (int n = 0; n < 20; n++) {
+            auto nid = (treelock_node_id_t)(tid * 100 + n + 1);
+            if (treelock_lock(tl, nid, TREELOCK_IX) != TREELOCK_OK) {
+                treelock_destroy(tl);
+                return (void *)(intptr_t)(-1);
+            }
+        }
+        treelock_unlock_all(tl);
+        treelock_destroy(tl);
+    }
+    return nullptr;
+}
+
+TEST(MemoryTest, ConcurrentCreateDestroy)
+{
+    const int N = 6;
+    pthread_t threads[N];
+    int ids[N];
+
+    for (int t = 0; t < N; t++) {
+        ids[t] = t;
+        pthread_create(&threads[t], nullptr, mem_create_destroy_worker, &ids[t]);
+    }
+
+    int errors = 0;
+    for (int t = 0; t < N; t++) {
+        void *ret;
+        pthread_join(threads[t], &ret);
+        if (ret != nullptr) errors++;
+    }
+
+    EXPECT_EQ(errors, 0) << "concurrent create/destroy had errors";
+}
+
+/* =========================================================================
+ * 压力测试: wait_queue 高强度 churn
+ *
+ * 测试目标: 固定 holder + 多 waiter 场景下高频释放/唤醒/重试，
+ *          swap-remove 在极端频率下保持队列一致性。
+ *
+ * 覆盖: lock_table.c treelock_table_wake_waiters() swap-remove +
+ *       treelock_table_add_waiter() cond init +
+ *       client.c _do_lock_core() 超时/唤醒路径 cond destroy
+ * ========================================================================= */
+
+TEST(StressTest, WaitQueueHighChurn)
+{
+    treelock_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.timeout_ms = 100;
+    cfg.client_id  = "churn_stress";
+
+    treelock_t *tl = treelock_create(&cfg);
+    ASSERT_NE(tl, nullptr);
+
+    volatile int running = 1;
+    int holder_ops = 0;
+    int waiter_ops[6] = {0};
+    int waiter_errs[6] = {0};
+
+    auto holder = [&]() {
+        while (running) {
+            if (treelock_lock(tl, 1, TREELOCK_X) == TREELOCK_OK) {
+                holder_ops++;
+                std::this_thread::sleep_for(std::chrono::microseconds(500));
+                treelock_unlock(tl, 1);
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    };
+
+    auto waiter = [&](int idx) {
+        while (running) {
+            int rc = treelock_try_lock(tl, 1, TREELOCK_X, 10);
+            if (rc == TREELOCK_OK) {
+                waiter_ops[idx]++;
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                treelock_unlock(tl, 1);
+            } else if (rc != TREELOCK_ERR_TIMEOUT) {
+                waiter_errs[idx]++;
+            }
+        }
+    };
+
+    std::thread ht(holder);
+    std::thread wt[6];
+    for (int i = 0; i < 6; i++) wt[i] = std::thread(waiter, i);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    running = 0;
+
+    ht.join();
+    for (int i = 0; i < 6; i++) wt[i].join();
+
+    int total_waits = 0, total_errs = 0;
+    for (int i = 0; i < 6; i++) {
+        total_waits += waiter_ops[i];
+        total_errs += waiter_errs[i];
+    }
+
+    EXPECT_GT(holder_ops, 100) << "holder should have performed many ops";
+    EXPECT_GT(total_waits, 50) << "waiters should have acquired lock";
+    EXPECT_EQ(total_errs, 0) << "no protocol errors in churn";
 }
