@@ -8,6 +8,8 @@
 
 **GitHub**: https://github.com/xyz2871309705-star/TREE_LOCKS
 
+🌐 **语言/Languages**: **简体中文** | [English](README.en.md) | [日本語](README.ja.md) | [Français](README.fr.md) | [Русский](README.ru.md)
+
 ---
 
 ## 目录

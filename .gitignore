@@ -45,6 +45,7 @@ _TEMP/
 
 # Claude Code local settings
 .claude/
+.understand-anything/
 
 # Third-party dependencies (fetched locally)
 _deps/
